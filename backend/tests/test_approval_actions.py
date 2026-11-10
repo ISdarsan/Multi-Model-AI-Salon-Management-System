@@ -55,6 +55,7 @@ def fresh():
     db = FakeDB(
         profiles=[{"id": MANAGER, "role": "manager"}, {"id": CUSTOMER, "role": "customer"}],
         purchase_orders=[{"id": "po1", "status": "draft"}],
+        tickets=[{"id": "tk1", "status": "open", "resolution_notes": None}],
         appointments=[{"id": "ap1", "staff_id": "aria", "status": "booked"},
                       {"id": "ap2", "staff_id": "aria", "status": "booked"},
                       {"id": "ap3", "staff_id": "ben", "status": "booked"}],
@@ -73,9 +74,15 @@ def fresh():
              "status": "awaiting_approval", "result": {"proposed": True, "applied": False, "new_status": "held"},
              "input": {"appointment_id": "ap3", "service": "Full Colour", "start_time": "2030-01-01T09:30:00+00:00",
                        "sku": "COL-6N", "current_status": "booked"}},
+            {"id": "act-r1", "event_id": "ev4", "agent_name": "cx_agent", "tool_called": "draft_reply",
+             "status": "awaiting_approval", "result": {"draft_text": "We are sorry. A manager will contact you.", "sent": False},
+             "input": {"ticket_id": "tk1", "feedback_id": "fb1", "service": "Full Colour"}},
+            {"id": "act-f1", "event_id": "ev4", "agent_name": "cx_agent", "tool_called": "suggest_refund",
+             "status": "awaiting_approval", "result": {"suggested_amount": 60.0, "applied": False},
+             "input": {"ticket_id": "tk1", "feedback_id": "fb1", "service": "Full Colour", "percent": 50, "basis": "Refund Policy"}},
         ],
         approvals=[{"id": f"apr-{n}", "agent_action_id": f"act-{n}", "status": "pending", "decided_by": None,
-                    "decided_at": None, "reason": None} for n in ("inv", "s1", "s2", "h1")],
+                    "decided_at": None, "reason": None} for n in ("inv", "s1", "s2", "h1", "r1", "f1")],
     )
     logs.clear()
     aa.supabase = db
@@ -104,6 +111,19 @@ def fresh():
         next(a for a in db["appointments"] if a["id"] == appointment_id)["status"] = "booked"
 
     aa.hold_appointment, aa.release_hold = fake_hold, fake_release
+
+    def fake_get_ticket(ticket_id):
+        return next((copy.deepcopy(t) for t in db["tickets"] if t["id"] == ticket_id), None)
+
+    def fake_resolve(ticket_id, notes):
+        ticket = next(t for t in db["tickets"] if t["id"] == ticket_id)
+        ticket.update(status="resolved", resolution_notes=notes)
+        return copy.deepcopy(ticket)
+
+    def fake_restore(ticket_id, status, notes):
+        next(t for t in db["tickets"] if t["id"] == ticket_id).update(status=status, resolution_notes=notes)
+
+    aa.get_ticket, aa.resolve_ticket, aa.restore_ticket = fake_get_ticket, fake_resolve, fake_restore
     return db
 
 
@@ -213,6 +233,53 @@ def main():
           and row(db, "appointments", "ap3")["status"] == "booked")
     db = fresh(); aa.approve("apr-h1", MANAGER)
     check("approving a hold twice is refused", "already approved" in (raises(ValueError, aa.approve, "apr-h1", MANAGER) or ""))
+
+    print("\n== CX Agent approvals (draft_reply and suggest_refund) ==")
+    db = fresh()
+    changes = aa.approve("apr-r1", MANAGER)
+    check("approve draft_reply returns approval, agent_action, decision_log, ticket", set(changes) == {"approval", "agent_action", "decision_log", "ticket"})
+    check("the ticket is now 'resolved' and its notes keep the approved draft", row(db, "tickets", "tk1")["status"] == "resolved"
+          and "We are sorry" in row(db, "tickets", "tk1")["resolution_notes"])
+    check("approval 'approved', action 'executed', applied = true, still NOT sent",
+          row(db, "approvals", "apr-r1")["status"] == "approved" and row(db, "agent_actions", "act-r1")["status"] == "executed"
+          and row(db, "agent_actions", "act-r1")["result"]["applied"] is True and row(db, "agent_actions", "act-r1")["result"]["sent"] is False)
+    check("decision_log: 'reply approved, ticket resolved' and it says nothing was sent",
+          logs[-1]["outcome"] == "reply approved, ticket resolved" and "Nothing was sent" in logs[-1]["reasoning"]
+          and logs[-1]["agents"] == ["cx_agent"])
+    db = fresh()
+    changes = aa.approve("apr-f1", MANAGER)
+    check("approve suggest_refund resolves the ticket and records the amount",
+          row(db, "tickets", "tk1")["status"] == "resolved" and "60.0" in row(db, "tickets", "tk1")["resolution_notes"]
+          and "50% refund" in row(db, "tickets", "tk1")["resolution_notes"])
+    check("decision_log: 'refund approved, ticket resolved'", logs[-1]["outcome"] == "refund approved, ticket resolved")
+    db = fresh()
+    changes = aa.reject("apr-f1", MANAGER, "Not justified, the colour was as agreed")
+    check("reject suggest_refund: the ticket is NOT changed (still open)", row(db, "tickets", "tk1")["status"] == "open"
+          and changes["ticket"]["status"] == "open")
+    check("reject: approval 'rejected' with the reason, action 'rejected', outcome 'refund rejected'",
+          row(db, "approvals", "apr-f1")["reason"] == "Not justified, the colour was as agreed"
+          and row(db, "agent_actions", "act-f1")["status"] == "rejected" and logs[-1]["outcome"] == "refund rejected"
+          and "as agreed" in logs[-1]["reasoning"])
+    db = fresh()
+    aa.reject("apr-r1", MANAGER, "Wording is too cold")
+    check("reject draft_reply: outcome 'reply rejected', ticket unchanged", logs[-1]["outcome"] == "reply rejected"
+          and row(db, "tickets", "tk1")["status"] == "open")
+    db = fresh(); db["tickets"].clear()
+    message = raises(ValueError, aa.approve, "apr-f1", MANAGER)
+    check("a missing ticket refuses the approval (it stays pending)", message and "not found" in message
+          and row(db, "approvals", "apr-f1")["status"] == "pending")
+    db = fresh(); aa.approve("apr-f1", MANAGER)
+    check("approving a refund twice is refused", "already approved" in (raises(ValueError, aa.approve, "apr-f1", MANAGER) or ""))
+    db = fresh()
+    check("a customer cannot approve a refund", raises(PermissionError, aa.approve, "apr-f1", CUSTOMER) is not None
+          and row(db, "tickets", "tk1")["status"] == "open")
+    db = fresh()
+    original_decide = aa._decide
+    aa._decide = lambda *a, **k: (_ for _ in ()).throw(ValueError("decided by someone else"))
+    raises(ValueError, aa.approve, "apr-f1", MANAGER)
+    aa._decide = original_decide
+    check("if the approval fails half way, the ticket is put back (open)", row(db, "tickets", "tk1")["status"] == "open"
+          and row(db, "tickets", "tk1")["resolution_notes"] is None)
 
     print("\nALL OFFLINE APPROVAL CHECKS PASSED (no database rows written)")
 

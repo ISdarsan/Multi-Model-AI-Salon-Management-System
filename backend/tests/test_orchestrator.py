@@ -174,11 +174,13 @@ def cap():
 
 def routing():
     print("\n== 7. routing ==")
-    check("stock_low and shelf_observation -> inventory_agent, staff_absent -> scheduling_agent",
-          orch.ROUTES == {"stock_low": "inventory_agent", "shelf_observation": "inventory_agent", "staff_absent": "scheduling_agent"})
+    check("stock_low and shelf_observation -> inventory_agent, staff_absent -> scheduling_agent (unchanged)",
+          orch.ROUTES["stock_low"] == ["inventory_agent"] and orch.ROUTES["shelf_observation"] == ["inventory_agent"]
+          and orch.ROUTES["staff_absent"] == ["scheduling_agent"])
+    check("complaint_received -> quality_agent THEN cx_agent", orch.ROUTES["complaint_received"] == ["quality_agent", "cx_agent"])
     check("is_routed is True for routed types", all(orch.is_routed({"type": t}) for t in orch.ROUTES))
-    check("an unrouted type (queue_overload) is NOT routed, so the worker skips it",
-          not orch.is_routed({"type": "queue_overload"}) and not orch.is_routed({"type": "complaint_received"}))
+    check("an unrouted type (booking_created) is NOT routed, so the worker skips it",
+          not orch.is_routed({"type": "booking_created"}) and not orch.is_routed({"type": "something_new"}))
 
     handled, statuses = [], []
     fake_inventory = lambda ev: handled.append(("inventory", ev["id"])) or {

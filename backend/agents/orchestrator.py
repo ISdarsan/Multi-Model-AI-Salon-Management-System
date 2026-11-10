@@ -17,9 +17,10 @@ IMPORTANT: the Orchestrator never changes an appointment itself. It only writes 
 appointment becomes 'held' later, when a manager approves (backend/approvals/approval_actions.py).
 """
 
+import inspect
 from datetime import datetime, timedelta, timezone
 
-from backend.agents import inventory_agent, scheduling_agent
+from backend.agents import cx_agent, inventory_agent, quality_agent, scheduling_agent
 from backend.agents.scheduling_agent import parse_dt
 from backend.ai import short_explanation
 from backend.db import add_decision_log, supabase
@@ -35,18 +36,24 @@ MAX_HOLDS_PER_EVENT = 3   # at most 3 hold proposals per event (earliest booking
 # 1. Routing: which agent handles which event type
 # ----------------------------------------------------------------------------
 
-# event type -> agent name. Event types that are NOT in this dictionary have no agent yet.
+# event type -> the agents that handle it, IN ORDER. Event types that are NOT in this dictionary have no agent yet.
+# When several agents are listed they run one after the other and share a `context` dictionary,
+# so a later agent can use what an earlier one found (for example the Quality Agent's finding).
 ROUTES = {
-    "stock_low": "inventory_agent",
-    "shelf_observation": "inventory_agent",
-    "staff_absent": "scheduling_agent",
+    "stock_low": ["inventory_agent"],
+    "shelf_observation": ["inventory_agent"],
+    "staff_absent": ["scheduling_agent"],
+    "complaint_received": ["quality_agent", "cx_agent"],
 }
 
 # agent name -> the function that handles ONE event that is already marked 'processing'.
 # To add an agent later: write its handle_event function, add it here, add its types above.
+# (A handle_event function may take an optional second argument called `context`.)
 AGENTS = {
     "inventory_agent": inventory_agent.handle_event,
     "scheduling_agent": scheduling_agent.handle_event,
+    "quality_agent": quality_agent.handle_event,
+    "cx_agent": cx_agent.handle_event,
 }
 
 # After the Inventory Agent handles one of these, the Orchestrator runs the clash check.
@@ -56,9 +63,23 @@ STOCK_EVENT_TYPES = ["stock_low", "shelf_observation"]
 CLASH_AGENTS = ["orchestrator", "inventory_agent", "scheduling_agent"]
 
 
+def agents_for(event_type: str) -> list:
+    """The names of the agents that handle this event type (an empty list if none do)."""
+    names = ROUTES.get(event_type) or []
+    return [names] if isinstance(names, str) else list(names)
+
+
 def is_routed(event: dict) -> bool:
-    """True if some agent handles this event type. The worker leaves other events alone."""
-    return AGENTS.get(ROUTES.get(event["type"])) is not None
+    """True if agents handle this event type (and all of them exist). The worker leaves other events alone."""
+    names = agents_for(event["type"])
+    return bool(names) and all(AGENTS.get(name) is not None for name in names)
+
+
+def call_agent(agent, event: dict, context: dict) -> dict:
+    """Run one agent. Agents that accept a `context` argument get it; older agents only get the event."""
+    if "context" in inspect.signature(agent).parameters:
+        return agent(event, context=context)
+    return agent(event)
 
 
 # ----------------------------------------------------------------------------
@@ -257,28 +278,40 @@ def fail_event(event: dict, agent_name: str, error: Exception, what: str) -> dic
 def handle_event(event: dict) -> dict:
     """
     Handle ONE event that the worker has already marked 'processing'.
-    Routes it to its agent, then (for stock events) runs the clash check. Always returns a summary.
+    Runs its agents in order (they share a `context`), then (for stock events) runs the clash check.
+    Always returns a summary.
     """
-    agent_name = ROUTES.get(event["type"])
-    agent = AGENTS.get(agent_name)
-    if agent is None:
+    names = agents_for(event["type"])
+    if not names or any(AGENTS.get(name) is None for name in names):
         raise ValueError(f"no agent handles events of type '{event['type']}'")
 
-    # Step 1: let the specialist agent do its work. A crash must not escape: mark the event failed.
-    try:
-        summary = agent(event)
-    except Exception as error:
-        return fail_event(event, agent_name, error, f"The {agent_name} crashed")
-    summary["routed_to"] = agent_name
+    summary = {"event_id": event["id"], "type": event["type"], "status": "handled", "results": [],
+               "routed_to": " + ".join(names)}
+    context = {}   # what the agents tell each other while handling this event
+
+    # Step 1: let the specialist agents do their work, one after the other.
+    # A crash must not escape: the event is marked failed and the reason is logged.
+    for name in names:
+        try:
+            part = call_agent(AGENTS[name], event, context)
+        except Exception as error:
+            return fail_event(event, name, error, f"The {name} crashed")
+        summary["results"] = summary["results"] + list(part.get("results") or [])
+        if part.get("status") == "failed":
+            # The agent already marked the event failed and logged why. Stop here.
+            return {**summary, "status": "failed", "error": part.get("error")}
+
+    # All agents finished: the event is handled. (Some agents already set this; setting it again is harmless.)
+    supabase.table("events").update({"status": "handled"}).eq("id", event["id"]).execute()
 
     # Step 2: for stock events, check the low products against upcoming bookings. This runs even if
     # the Inventory Agent skipped (for example because an order already exists). It does not run
     # if the Inventory Agent failed, because then we do not know which products are low.
-    if event["type"] in STOCK_EVENT_TYPES and summary.get("status") == "handled":
+    if event["type"] in STOCK_EVENT_TYPES:
         skus = list(dict.fromkeys(r["sku"] for r in summary["results"] if r.get("sku")))
         try:
             summary["results"] = summary["results"] + check_clashes(event, skus)
         except Exception as error:
-            return fail_event(event, agent_name, error, "The clash check failed")
+            return fail_event(event, names[0], error, "The clash check failed")
 
     return summary

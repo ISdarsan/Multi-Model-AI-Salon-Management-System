@@ -68,9 +68,9 @@ begin;
 alter table public.decision_log disable trigger decision_log_no_update_delete;
 delete from public.decision_log
   where event_id in (select id from public.events
-                    where source in ('inventory_test', 'worker_test', 'scheduling_test', 'orchestrator_test', 'dashboard_test'));
+                    where source in ('inventory_test', 'worker_test', 'scheduling_test', 'orchestrator_test', 'dashboard_test', 'complaint_test'));
 alter table public.decision_log enable trigger decision_log_no_update_delete;
-delete from public.events where source in ('inventory_test', 'worker_test', 'scheduling_test', 'orchestrator_test', 'dashboard_test');
+delete from public.events where source in ('inventory_test', 'worker_test', 'scheduling_test', 'orchestrator_test', 'dashboard_test', 'complaint_test');
 commit;
 ```
 
@@ -167,3 +167,20 @@ npm run dev
 Open http://localhost:5173 and sign in with `manager@salonos.demo` / `demo1234` (demo login from the seed). A customer login such as `customer1@salonos.demo` sees "This area is for managers only". The dashboard must run on port 5173, because the server only accepts requests from `http://localhost:5173`.
 
 Check the approve and reject endpoints (uses your real database, cleans up after itself): `python -m backend.tests.test_approval_api`. Build check: `cd frontend; npm run build`.
+
+## CX Agent and Quality Agent (scenario 3: a customer complaint)
+
+When a customer leaves feedback with a rating of 2 or lower, the database creates a `complaint_received` event. The Orchestrator runs the **Quality Agent**, then the **CX Agent**, which share what they find.
+
+- **Quality Agent** (`backend/agents/quality_agent.py`): reads the appointment's service-log notes and flags a problem with keyword rules (for example "over target", "uneven", "delay"). A flag is saved as a low-risk `flag_quality_issue` action.
+- **CX Agent** (`backend/agents/cx_agent.py`): classifies the complaint with keyword rules (service quality, wait time, price, product, staff behaviour), saves the category and sentiment on the feedback row, opens a ticket (rating 1 = high, 2 = medium priority), finds the best matching `salon_policies` by keywords, and drafts a reply (**medium** risk, `draft_reply`).
+- **Refund or compensation:** only if the complaint looks justified (the Quality Agent flagged a problem, or the rating is 1). It suggests 50% of the service price under the Refund Policy (10% for a wait-time complaint under the Delay Compensation policy) as a **high**-risk `suggest_refund`. It never goes above the policy limit.
+- **One decision_log row** per complaint (`agents_involved` = `cx_agent`, `quality_agent`) with the real details: rating, category, service, stylist, what the service log says, matching policies, and the refund decision.
+- **Approving** a reply or a refund marks the ticket `resolved` (the refund amount is written in the ticket notes). **Nothing is ever sent to a customer** and no money moves: a draft is only text kept in the proposal. Rejecting changes nothing and logs the reason.
+
+The wording of the draft reply is the only thing the AI writes (Ollama; a template sentence is used if it fails). Tests:
+
+```powershell
+python -m backend.tests.test_cx_quality      # offline, no database writes
+python -m backend.tests.test_complaint_flow  # live: uses your database. Stop the worker first.
+```

@@ -11,6 +11,11 @@ Two functions, which work for ALL agents (the action's tool_called decides what 
                                      reject  -> the appointment is NOT changed.
   hold_appointment (Orchestrator):   approve -> the appointment becomes 'held' (refused if it is no longer 'booked').
                                      reject  -> the appointment is NOT changed.
+  draft_reply (CX Agent):            approve -> the ticket is marked 'resolved'. NOTHING is sent to the customer.
+                                     reject  -> nothing changes, the reason is logged.
+  suggest_refund (CX Agent):         approve -> the ticket is marked 'resolved' with the approved amount in its notes.
+                                     (No money moves: the system only records the manager's decision.)
+                                     reject  -> nothing changes, the reason is logged.
 
 Both also ADD a row to decision_log. Old decision_log rows are never edited or deleted.
 
@@ -20,6 +25,7 @@ approval is refused instead of being applied twice.
 """
 
 from backend.db import add_decision_log, now_iso, supabase
+from backend.tools.cx_tools import get_ticket, resolve_ticket, restore_ticket
 from backend.tools.orchestrator_tools import hold_appointment, release_hold
 from backend.tools.scheduling_tools import get_appointment, reassign_staff
 
@@ -66,6 +72,8 @@ def approve(approval_id: str, decided_by: str) -> dict:
         return _approve_reassignment(approval_id, decided_by, action)
     if action["tool_called"] == "hold_appointment":
         return _approve_hold(approval_id, decided_by, action)
+    if action["tool_called"] in SIMPLE_TOOLS:
+        return _approve_simple(approval_id, decided_by, action)
 
     approval_row = _decide(approval_id, "approved", decided_by)
     po_row = None
@@ -92,6 +100,8 @@ def reject(approval_id: str, decided_by: str, reason: str) -> dict:
         return _reject_reassignment(approval_id, decided_by, action, reason.strip())
     if action["tool_called"] == "hold_appointment":
         return _reject_hold(approval_id, decided_by, action, reason.strip())
+    if action["tool_called"] in SIMPLE_TOOLS:
+        return _reject_simple(approval_id, decided_by, action, reason.strip())
 
     approval_row = _decide(approval_id, "rejected", decided_by, reason.strip())
     po_row = None
@@ -219,3 +229,68 @@ def _reject_hold(approval_id: str, decided_by: str, action: dict, reason: str) -
     # The appointment is returned exactly as it is now, to show that it was not touched.
     return {"approval": approval_row, "appointment": get_appointment(info["appointment_id"]),
             "agent_action": action_row, "decision_log": log_row}
+
+
+# ----------------------------------------------------------------------------
+# Proposals that only record a decision (and maybe resolve a ticket)
+# ----------------------------------------------------------------------------
+
+# tool_called -> (outcome when approved, outcome when rejected, what it is called in the log)
+SIMPLE_TOOLS = {
+    "draft_reply": ("reply approved, ticket resolved", "reply rejected", "the draft reply"),
+    "suggest_refund": ("refund approved, ticket resolved", "refund rejected", "the suggested refund"),
+}
+
+
+def _ticket_notes(action: dict, decided_by: str) -> str:
+    """The note saved on the ticket when a manager approves a reply or a refund."""
+    info, result = action["input"], action.get("result") or {}
+    if action["tool_called"] == "suggest_refund":
+        return (f"Manager {decided_by} approved a {info.get('percent')}% refund/compensation of "
+                f"{result.get('suggested_amount')} for the {info.get('service')} ({info.get('basis')}).")
+    return f"Manager {decided_by} approved the reply (not sent). Draft: {result.get('draft_text')}"
+
+
+def _approve_simple(approval_id: str, decided_by: str, action: dict) -> dict:
+    """Approve a proposal that only records a decision. If it belongs to a ticket, the ticket is resolved."""
+    approved_outcome, _, name = SIMPLE_TOOLS[action["tool_called"]]
+    ticket_id = action["input"].get("ticket_id")
+
+    # Resolve the ticket FIRST. If the approval then fails, the ticket is put back.
+    old_ticket = ticket_row = None
+    if ticket_id:
+        old_ticket = get_ticket(ticket_id)
+        if not old_ticket:
+            raise ValueError(f"ticket {ticket_id} not found, so {name} cannot be approved")
+        ticket_row = resolve_ticket(ticket_id, _ticket_notes(action, decided_by))
+    try:
+        approval_row = _decide(approval_id, "approved", decided_by)
+    except Exception:
+        if old_ticket:
+            restore_ticket(ticket_id, old_ticket["status"], old_ticket["resolution_notes"])
+        raise
+
+    result = {**(action.get("result") or {}), "applied": True}   # (a draft's "sent" stays False)
+    action_row = (supabase.table("agent_actions").update({"status": "executed", "result": result})
+                  .eq("id", action["id"]).execute().data[0])
+    log_row = add_decision_log(
+        action["event_id"], [action["agent_name"]],
+        f"Manager {decided_by} approved {name}." + (" The ticket is now resolved." if ticket_id else "")
+        + " Nothing was sent to the customer.",
+        approved_outcome,
+    )
+    return {"approval": approval_row, "agent_action": action_row, "decision_log": log_row, "ticket": ticket_row}
+
+
+def _reject_simple(approval_id: str, decided_by: str, action: dict, reason: str) -> dict:
+    """Reject it: nothing changes (the ticket stays as it is). Only the reason is recorded."""
+    _, rejected_outcome, name = SIMPLE_TOOLS[action["tool_called"]]
+    approval_row = _decide(approval_id, "rejected", decided_by, reason)
+    action_row = supabase.table("agent_actions").update({"status": "rejected"}).eq("id", action["id"]).execute().data[0]
+    log_row = add_decision_log(
+        action["event_id"], [action["agent_name"]],
+        f"Manager {decided_by} rejected {name}. Reason: {reason}", rejected_outcome,
+    )
+    ticket_id = action["input"].get("ticket_id")
+    return {"approval": approval_row, "agent_action": action_row, "decision_log": log_row,
+            "ticket": get_ticket(ticket_id) if ticket_id else None}

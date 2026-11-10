@@ -174,10 +174,10 @@ def full_flow():
 def worker_routing():
     print("\n== 12. the Orchestrator routes staff_absent to the Scheduling Agent ==")
     import backend.agents.orchestrator as orchestrator
-    check("ROUTES['staff_absent'] == 'scheduling_agent'", orchestrator.ROUTES["staff_absent"] == "scheduling_agent")
+    check("ROUTES['staff_absent'] starts with the Scheduling Agent", orchestrator.ROUTES["staff_absent"][0] == "scheduling_agent")
     check("the Scheduling Agent's handle_event is registered", orchestrator.AGENTS["scheduling_agent"] is agent.handle_event)
     check("Inventory routes are unchanged",
-          orchestrator.ROUTES["stock_low"] == orchestrator.ROUTES["shelf_observation"] == "inventory_agent")
+          orchestrator.ROUTES["stock_low"] == orchestrator.ROUTES["shelf_observation"] == ["inventory_agent"])
 
 
 if __name__ == "__main__":

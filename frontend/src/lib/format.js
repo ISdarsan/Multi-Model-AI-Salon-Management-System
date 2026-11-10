@@ -24,6 +24,8 @@ const AGENT_NAMES = {
   inventory_agent: 'Inventory Agent',
   scheduling_agent: 'Scheduling Agent',
   orchestrator: 'Orchestrator',
+  cx_agent: 'CX Agent',
+  quality_agent: 'Quality Agent',
 }
 export const agentName = (name) => AGENT_NAMES[name] || name
 
@@ -53,6 +55,19 @@ export function describeAction(action, products = {}) {
       detail: `It needs ${input.units_needed} × ${input.sku}, but only ${input.stock_before_this_booking} would be left for it.`,
     }
   }
+  if (action.tool_called === 'draft_reply') {
+    return {
+      title: `Send a reply to the customer who complained about the ${input.service || 'visit'}`,
+      detail: `Draft: "${result.draft_text}" Nothing is sent to the customer, even if you approve. Approving resolves the ticket.`,
+    }
+  }
+  if (action.tool_called === 'suggest_refund') {
+    const kind = input.basis === 'Delay Compensation' ? 'compensation' : 'refund'
+    return {
+      title: `Give a ${kind} of ${Number(result.suggested_amount).toFixed(2)} (${input.percent}%) for the ${input.service}`,
+      detail: `Under the ${input.basis}, because ${(input.reasons || []).join(' and ')}. Only a manager can decide this. Approving records your decision and resolves the ticket.`,
+    }
+  }
   return { title: action.tool_called, detail: '' }
 }
 
@@ -61,4 +76,7 @@ export const PROPOSAL_OUTCOME = {
   create_draft_po: 'draft PO created, waiting for approval',
   reassign_staff: 'reassignment proposed, waiting for approval',
   hold_appointment: 'clash found, hold proposed, waiting for approval',
+  // A complaint writes ONE log row that explains both its reply and its refund suggestion.
+  draft_reply: 'complaint handled, waiting for approval',
+  suggest_refund: 'complaint handled, waiting for approval',
 }
