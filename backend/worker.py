@@ -1,9 +1,11 @@
 """
-worker.py - runs forever and hands new events to the right agent.
+worker.py - runs forever and hands new events to the Orchestrator.
 
 Every 3 seconds it looks in the `events` table for rows with status 'new' (oldest first).
-For each one it finds the agent in ROUTES below, marks the event 'processing' (so it can
-never be picked up twice), and runs the agent. Events with no agent yet are left alone.
+For each one it asks the Orchestrator whether any agent handles that event type. If so, it marks
+the event 'processing' (so it can never be picked up twice) and gives it to the Orchestrator,
+which decides which agent runs (see ROUTES in backend/agents/orchestrator.py).
+Events with no agent yet are left alone.
 
 Start it from the project root:   python -m backend.worker
 Stop it with Ctrl+C (it finishes the event it is working on first).
@@ -13,26 +15,12 @@ import signal
 import time
 from datetime import datetime
 
-from backend.agents import inventory_agent, scheduling_agent
+from backend.agents import orchestrator
 from backend.db import add_decision_log, claim_event, supabase
 
 # ----------------------------------------------------------------------------
-# 1. Settings: which agent handles which event type
+# 1. Settings
 # ----------------------------------------------------------------------------
-
-# event type -> agent name. Event types that are NOT in this dictionary have no agent yet.
-ROUTES = {
-    "stock_low": "inventory_agent",
-    "shelf_observation": "inventory_agent",
-    "staff_absent": "scheduling_agent",
-}
-
-# agent name -> the function that handles ONE event that is already marked 'processing'.
-# To add an agent later: write its handle_event function, add it here, add its types above.
-AGENTS = {
-    "inventory_agent": inventory_agent.handle_event,
-    "scheduling_agent": scheduling_agent.handle_event,
-}
 
 POLL_SECONDS = 3       # how often to look for new events
 MAX_EVENTS = 200       # how many new events to read per look
@@ -72,6 +60,7 @@ def fetch_new_events() -> list:
 
 
 def mark_failed(event: dict, agent_name: str, error: Exception):
+    # (A safety net: the Orchestrator already handles agent crashes itself.)
     """Mark an event 'failed' and write the reason to decision_log. Never raises."""
     try:
         supabase.table("events").update({"status": "failed"}).eq("id", event["id"]).execute()
@@ -79,7 +68,7 @@ def mark_failed(event: dict, agent_name: str, error: Exception):
         pass
     try:
         add_decision_log(event["id"], [agent_name],
-                         f"Worker: the agent crashed: {type(error).__name__}: {error}", "event failed")
+                         f"Worker: the Orchestrator crashed: {type(error).__name__}: {error}", "event failed")
     except Exception:
         pass  # if even the log fails, the 'failed' status is still set
 
@@ -91,7 +80,7 @@ def outcome_text(summary: dict) -> str:
     results = summary.get("results") or []
     if len(results) == 1:
         return results[0]["outcome"]
-    # Each result has a short name: a product sku (Inventory Agent) or a label (Scheduling Agent).
+    # Each result has a short name: a product sku (Inventory Agent) or a label (Scheduling Agent, Orchestrator).
     return "; ".join(f"{r.get('sku') or r.get('label') or '-'}: {r['outcome']}" for r in results) or "handled"
 
 
@@ -100,16 +89,13 @@ def outcome_text(summary: dict) -> str:
 # ----------------------------------------------------------------------------
 
 def handle_events(events: list):
-    """Go through a list of new events, oldest first, and give each to its agent."""
+    """Go through a list of new events, oldest first, and give each to the Orchestrator."""
     for event in events:
         if stop_requested:
             break  # Ctrl+C was pressed: do not start any more events
 
-        agent_name = ROUTES.get(event["type"])
-        agent = AGENTS.get(agent_name)
-
         # No agent for this type yet: leave the event as 'new' and say so only once.
-        if agent is None:
+        if not orchestrator.is_routed(event):
             if event["id"] not in already_reported:
                 already_reported.add(event["id"])
                 say(f"event {describe(event)} -> no agent yet, left as 'new'")
@@ -119,13 +105,13 @@ def handle_events(events: list):
         if not claim_event(event["id"]):
             continue
 
-        # Run the agent. One crashing agent must never stop the worker.
+        # Give it to the Orchestrator. Nothing that goes wrong may stop the worker.
         try:
-            summary = agent(event)
-            say(f"event {describe(event)} -> {agent_name} -> {outcome_text(summary)}")
+            summary = orchestrator.handle_event(event)
+            say(f"event {describe(event)} -> orchestrator -> {summary.get('routed_to')} -> {outcome_text(summary)}")
         except Exception as error:
-            mark_failed(event, agent_name, error)
-            say(f"event {describe(event)} -> {agent_name} -> FAILED: {type(error).__name__}: {error}")
+            mark_failed(event, "orchestrator", error)
+            say(f"event {describe(event)} -> orchestrator -> FAILED: {type(error).__name__}: {error}")
 
 
 # ----------------------------------------------------------------------------
@@ -147,7 +133,7 @@ def main():
         if hasattr(signal, name):
             signal.signal(getattr(signal, name), request_stop)
 
-    say(f"worker started. Looking for new events every {POLL_SECONDS}s. Routes: {ROUTES}. Press Ctrl+C to stop.")
+    say(f"worker started. Looking for new events every {POLL_SECONDS}s. Routes: {orchestrator.ROUTES}. Press Ctrl+C to stop.")
     last_problem = None
 
     while not stop_requested:

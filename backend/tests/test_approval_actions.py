@@ -5,6 +5,7 @@ It never touches the real database.
 It proves two things:
   - Inventory Agent approvals (create_draft_po) still work exactly as before.
   - Scheduling Agent approvals (reassign_staff) change the appointment only on approve.
+  - Orchestrator approvals (hold_appointment) make the appointment 'held' only on approve.
 
 Run it from the project root:   python -m backend.tests.test_approval_actions
 """
@@ -55,7 +56,8 @@ def fresh():
         profiles=[{"id": MANAGER, "role": "manager"}, {"id": CUSTOMER, "role": "customer"}],
         purchase_orders=[{"id": "po1", "status": "draft"}],
         appointments=[{"id": "ap1", "staff_id": "aria", "status": "booked"},
-                      {"id": "ap2", "staff_id": "aria", "status": "booked"}],
+                      {"id": "ap2", "staff_id": "aria", "status": "booked"},
+                      {"id": "ap3", "staff_id": "ben", "status": "booked"}],
         agent_actions=[
             {"id": "act-inv", "event_id": "ev1", "agent_name": "inventory_agent", "tool_called": "create_draft_po",
              "status": "awaiting_approval", "input": {}, "result": {"purchase_order_id": "po1", "sku": "COL-6N", "qty": 16}},
@@ -67,9 +69,13 @@ def fresh():
              "status": "awaiting_approval", "result": {"proposed": True, "applied": False},
              "input": {"appointment_id": "ap2", "service": "Men's Cut", "start_time": "2030-01-01T12:30:00+00:00",
                        "old_staff_id": "aria", "old_staff_name": "Aria", "new_staff_id": "dev", "new_staff_name": "Dev"}},
+            {"id": "act-h1", "event_id": "ev3", "agent_name": "orchestrator", "tool_called": "hold_appointment",
+             "status": "awaiting_approval", "result": {"proposed": True, "applied": False, "new_status": "held"},
+             "input": {"appointment_id": "ap3", "service": "Full Colour", "start_time": "2030-01-01T09:30:00+00:00",
+                       "sku": "COL-6N", "current_status": "booked"}},
         ],
         approvals=[{"id": f"apr-{n}", "agent_action_id": f"act-{n}", "status": "pending", "decided_by": None,
-                    "decided_at": None, "reason": None} for n in ("inv", "s1", "s2")],
+                    "decided_at": None, "reason": None} for n in ("inv", "s1", "s2", "h1")],
     )
     logs.clear()
     aa.supabase = db
@@ -86,6 +92,18 @@ def fresh():
         return copy.deepcopy(row)
 
     aa.reassign_staff = fake_reassign
+
+    def fake_hold(appointment_id):
+        row = next(a for a in db["appointments"] if a["id"] == appointment_id)
+        if row["status"] != "booked":
+            raise ValueError(f"appointment {appointment_id} is no longer 'booked', so it cannot be put on hold")
+        row["status"] = "held"
+        return copy.deepcopy(row)
+
+    def fake_release(appointment_id):
+        next(a for a in db["appointments"] if a["id"] == appointment_id)["status"] = "booked"
+
+    aa.hold_appointment, aa.release_hold = fake_hold, fake_release
     return db
 
 
@@ -162,6 +180,39 @@ def main():
           and row(db, "approvals", "apr-s1")["status"] == "pending" and row(db, "agent_actions", "act-s1")["status"] == "awaiting_approval")
     db = fresh(); row(db, "appointments", "ap1")["status"] = "cancelled"
     check("a cancelled appointment cannot be reassigned", "cancelled" in (raises(ValueError, aa.approve, "apr-s1", MANAGER) or ""))
+
+    print("\n== Orchestrator approvals (hold_appointment) ==")
+    db = fresh()
+    changes = aa.approve("apr-h1", MANAGER)
+    check("approve returns approval, appointment, agent_action, decision_log", set(changes) == {"approval", "appointment", "agent_action", "decision_log"})
+    check("the appointment became 'held'", row(db, "appointments", "ap3")["status"] == "held" and changes["appointment"]["status"] == "held")
+    check("approval 'approved', action 'executed' with applied = true",
+          row(db, "approvals", "apr-h1")["status"] == "approved" and row(db, "agent_actions", "act-h1")["status"] == "executed"
+          and row(db, "agent_actions", "act-h1")["result"]["applied"] is True)
+    check("decision_log: 'hold approved and applied'", logs[-1]["outcome"] == "hold approved and applied"
+          and logs[-1]["agents"] == ["orchestrator"] and "COL-6N" in logs[-1]["reasoning"])
+    check("other appointments are untouched", row(db, "appointments", "ap1")["status"] == "booked")
+
+    db = fresh()
+    changes = aa.reject("apr-h1", MANAGER, "Supplier delivers tomorrow, keep the booking")
+    check("reject: the appointment is NOT changed", row(db, "appointments", "ap3")["status"] == "booked"
+          and changes["appointment"]["status"] == "booked")
+    check("approval 'rejected' with the reason, action 'rejected'",
+          row(db, "approvals", "apr-h1")["reason"] == "Supplier delivers tomorrow, keep the booking"
+          and row(db, "agent_actions", "act-h1")["status"] == "rejected")
+    check("decision_log: 'hold rejected' with the reason", logs[-1]["outcome"] == "hold rejected" and "keep the booking" in logs[-1]["reasoning"])
+
+    for status in ("held", "cancelled", "completed", "in_progress"):
+        db = fresh(); row(db, "appointments", "ap3")["status"] = status
+        message = raises(ValueError, aa.approve, "apr-h1", MANAGER)
+        check(f"approval is REFUSED when the appointment is already '{status}' (stays pending, nothing changes)",
+              message and "not 'booked'" in message and row(db, "approvals", "apr-h1")["status"] == "pending"
+              and row(db, "appointments", "ap3")["status"] == status)
+    db = fresh()
+    check("a customer cannot approve a hold", raises(PermissionError, aa.approve, "apr-h1", CUSTOMER) is not None
+          and row(db, "appointments", "ap3")["status"] == "booked")
+    db = fresh(); aa.approve("apr-h1", MANAGER)
+    check("approving a hold twice is refused", "already approved" in (raises(ValueError, aa.approve, "apr-h1", MANAGER) or ""))
 
     print("\nALL OFFLINE APPROVAL CHECKS PASSED (no database rows written)")
 

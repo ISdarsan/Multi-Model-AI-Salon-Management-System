@@ -1,8 +1,9 @@
 """
 test_worker.py - checks the worker's rules OFFLINE. It never touches the database.
 
-It feeds the worker a fake list of events and fake agents, and replaces the database
-with a recorder, so we can see exactly what the worker WOULD do.
+It feeds the worker a fake list of events and a fake Orchestrator, and replaces the database
+with a recorder, so we can see exactly what the worker WOULD do. (The Orchestrator's own rules
+are tested in test_orchestrator.py.)
 
 Run it from the project root:   python -m backend.tests.test_worker
 """
@@ -14,10 +15,10 @@ from unittest.mock import MagicMock
 import backend.worker as worker
 
 # ----------------------------------------------------------------------------
-# Fakes: a recorder instead of the database, and agents that do nothing real
+# Fakes: a recorder instead of the database, and an Orchestrator that does nothing real
 # ----------------------------------------------------------------------------
 
-calls = {"agent_ran_for": [], "claimed": [], "failed_events": [], "decision_logs": []}
+calls = {"orchestrator_ran_for": [], "claimed": [], "decision_logs": []}
 
 
 def fake_claim(event_id):
@@ -25,14 +26,22 @@ def fake_claim(event_id):
     return event_id != "e-taken"        # pretend another worker already took 'e-taken'
 
 
-def fake_inventory_agent(event):
-    calls["agent_ran_for"].append(event["id"])
-    return {"status": "handled", "results": [{"sku": "COL-6N", "outcome": "draft PO created, waiting for approval"}]}
+class FakeOrchestrator:
+    """Stands in for backend/agents/orchestrator.py: knows two routes, and one of them crashes."""
+    ROUTES = {"stock_low": "inventory_agent", "shelf_observation": "crashy_agent"}
 
+    @staticmethod
+    def is_routed(event):
+        return event["type"] in FakeOrchestrator.ROUTES
 
-def crashing_agent(event):
-    calls["agent_ran_for"].append(event["id"])
-    raise RuntimeError("boom, the agent crashed")
+    @staticmethod
+    def handle_event(event):
+        calls["orchestrator_ran_for"].append(event["id"])
+        agent_name = FakeOrchestrator.ROUTES[event["type"]]
+        if agent_name == "crashy_agent":
+            raise RuntimeError("boom, the agent crashed")
+        return {"status": "handled", "routed_to": agent_name,
+                "results": [{"sku": "COL-6N", "outcome": "draft PO created, waiting for approval"}]}
 
 
 fake_db = MagicMock()   # stands in for supabase; we look at what the worker asks it to do
@@ -40,9 +49,7 @@ worker.supabase = fake_db
 worker.claim_event = fake_claim
 worker.add_decision_log = lambda event_id, agents, reasoning, outcome: calls["decision_logs"].append(
     (event_id, agents, reasoning, outcome))
-
-worker.ROUTES = {"stock_low": "inventory_agent", "shelf_observation": "crashy_agent"}
-worker.AGENTS = {"inventory_agent": fake_inventory_agent, "crashy_agent": crashing_agent}
+worker.orchestrator = FakeOrchestrator
 
 
 def event(event_id, type_, payload=None):
@@ -67,17 +74,17 @@ def check(label, condition):
 # ----------------------------------------------------------------------------
 
 def main():
-    print("== 1. stock_low goes to the inventory agent ==")
+    print("== 1. a routed event is claimed first, then given to the Orchestrator ==")
     out = run_handle([event("e1", "stock_low", {"sku": "COL-6N"})])
     print("   printed:", out.strip())
-    check("agent ran for e1", calls["agent_ran_for"] == ["e1"])
-    check("event was claimed ('processing') BEFORE the agent ran", calls["claimed"] == ["e1"])
+    check("the Orchestrator was given e1", calls["orchestrator_ran_for"] == ["e1"])
+    check("event was claimed ('processing') BEFORE the Orchestrator ran", calls["claimed"] == ["e1"])
     check("line shows type, sku, agent and outcome",
-          "event stock_low (COL-6N) -> inventory_agent -> draft PO created, waiting for approval" in out)
+          "event stock_low (COL-6N) -> orchestrator -> inventory_agent -> draft PO created, waiting for approval" in out)
     check("line starts with a HH:MM:SS time", out[2] == ":" and out[5] == ":" and out[8] == " ")
 
     print("\n== 2. a type with no agent is skipped, and only reported ONCE ==")
-    calls["agent_ran_for"].clear(); calls["claimed"].clear()
+    calls["orchestrator_ran_for"].clear(); calls["claimed"].clear()
     queued = event("e2", "queue_overload", {"waiting_count": 7})
     first = run_handle([queued])
     second = run_handle([queued])     # the worker looks again 3 seconds later
@@ -85,34 +92,34 @@ def main():
     print("   second look:", repr(second))
     check("first look prints one skipped line", first.count("no agent yet") == 1)
     check("second look prints nothing", second == "")
-    check("agent was never run and event was never claimed or changed",
-          calls["agent_ran_for"] == [] and calls["claimed"] == [])
+    check("the Orchestrator was never called and the event was never claimed or changed",
+          calls["orchestrator_ran_for"] == [] and calls["claimed"] == [])
     check("db was not asked to change anything", fake_db.table.call_count == 0)
 
-    print("\n== 3. a crashing agent marks the event failed, and the worker keeps going ==")
-    calls["agent_ran_for"].clear(); calls["claimed"].clear()
+    print("\n== 3. if the Orchestrator crashes, the worker marks the event failed and keeps going ==")
+    calls["orchestrator_ran_for"].clear(); calls["claimed"].clear()
     crash = event("e3", "shelf_observation", {"observations": [{"sku": "SKN-001", "observed_count": 1}]})
     after = event("e4", "stock_low", {"sku": "COL-7N"})
     out = run_handle([crash, after])
     print("   printed:\n     " + out.strip().replace("\n", "\n     "))
-    check("crashing agent was run for e3", "e3" in calls["agent_ran_for"])
+    check("the crashing route was run for e3", "e3" in calls["orchestrator_ran_for"])
     check("event e3 was set to 'failed'",
           any(c.args == ({"status": "failed"},) for c in fake_db.table.return_value.update.call_args_list))
     check("the reason was written to decision_log",
           len(calls["decision_logs"]) == 1 and calls["decision_logs"][0][0] == "e3"
           and "boom, the agent crashed" in calls["decision_logs"][0][2] and calls["decision_logs"][0][3] == "event failed")
-    check("failure line printed with the reason", "FAILED: RuntimeError: boom, the agent crashed" in out)
-    check("worker carried on: the NEXT event (e4) was still handled", "e4" in calls["agent_ran_for"])
+    check("failure line printed with the reason", "-> orchestrator -> FAILED: RuntimeError: boom, the agent crashed" in out)
+    check("worker carried on: the NEXT event (e4) was still handled", "e4" in calls["orchestrator_ran_for"])
 
     print("\n== 4. an event another worker already took is left alone ==")
-    calls["agent_ran_for"].clear()
+    calls["orchestrator_ran_for"].clear()
     out = run_handle([event("e-taken", "stock_low", {"sku": "COL-6N"})])
-    check("no agent run and nothing printed", calls["agent_ran_for"] == [] and out == "")
+    check("the Orchestrator was not called and nothing printed", calls["orchestrator_ran_for"] == [] and out == "")
 
     print("\n== 5. events are handled oldest first (in the order they are given) ==")
-    calls["agent_ran_for"].clear()
+    calls["orchestrator_ran_for"].clear()
     run_handle([event("a", "stock_low"), event("b", "stock_low"), event("c", "stock_low")])
-    check("order a, b, c", calls["agent_ran_for"] == ["a", "b", "c"])
+    check("order a, b, c", calls["orchestrator_ran_for"] == ["a", "b", "c"])
 
     print("\n== 6. the main loop survives a database hiccup, and stops cleanly ==")
     state = {"looks": 0}

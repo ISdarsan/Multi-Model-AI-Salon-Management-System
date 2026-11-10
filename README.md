@@ -61,16 +61,16 @@ python -m backend.tests.test_inventory_agent
 
 Managers approve or reject with `backend/approvals/approval_actions.py` (`approve(approval_id, decided_by)` and `reject(approval_id, decided_by, reason)`).
 
-**Test leftovers:** `decision_log` can never be edited or deleted, and an event that has log rows cannot be deleted either. So the test cleans up purchase orders, actions and approvals, but leaves its events (`source = 'inventory_test'`) and their log rows (the other tests leave `worker_test` and `scheduling_test` events). To remove them by hand, paste this into the Supabase SQL Editor. It switches the protection off for a moment, so only run it for test data:
+**Test leftovers:** `decision_log` can never be edited or deleted, and an event that has log rows cannot be deleted either. So the test cleans up purchase orders, actions and approvals, but leaves its events (`source = 'inventory_test'`) and their log rows (the other tests leave `worker_test`, `scheduling_test` and `orchestrator_test` events). To remove them by hand, paste this into the Supabase SQL Editor. It switches the protection off for a moment, so only run it for test data:
 
 ```sql
 begin;
 alter table public.decision_log disable trigger decision_log_no_update_delete;
 delete from public.decision_log
   where event_id in (select id from public.events
-                    where source in ('inventory_test', 'worker_test', 'scheduling_test'));
+                    where source in ('inventory_test', 'worker_test', 'scheduling_test', 'orchestrator_test'));
 alter table public.decision_log enable trigger decision_log_no_update_delete;
-delete from public.events where source in ('inventory_test', 'worker_test', 'scheduling_test');
+delete from public.events where source in ('inventory_test', 'worker_test', 'scheduling_test', 'orchestrator_test');
 commit;
 ```
 
@@ -86,7 +86,7 @@ uvicorn backend.api.main:app --reload
 python -m backend.worker
 ```
 
-The worker prints one line per thing it does, for example `14:05:12 event stock_low (COL-6N) -> inventory_agent -> draft PO created, waiting for approval`. Which agent handles which event type is the `ROUTES` dictionary at the top of `backend/worker.py`. Event types with no agent yet stay `new` and are reported once.
+The worker prints one line per thing it does, for example `14:05:12 event stock_low (COL-6N) -> orchestrator -> inventory_agent -> draft PO created, waiting for approval`. The worker only claims events and hands them to the Orchestrator. Which agent handles which event type is the `ROUTES` dictionary at the top of `backend/agents/orchestrator.py`. Event types with no agent yet stay `new` and are reported once.
 
 Check the worker's rules without touching the database: `python -m backend.tests.test_worker`.
 
@@ -110,4 +110,26 @@ The worker sends `staff_absent` events to this agent. Tests:
 python -m backend.tests.test_scheduling_rules      # offline, no database writes
 python -m backend.tests.test_approval_actions      # offline, no database writes
 python -m backend.tests.test_scheduling_agent      # live: uses your database, restores appointments afterwards
+```
+
+## Orchestrator
+
+`backend/agents/orchestrator.py` sits between the worker and the agents. The worker claims each event and gives it to the Orchestrator, which does two things.
+
+**1. Routing.** It looks up the event type in `ROUTES` (`stock_low` and `shelf_observation` go to the Inventory Agent, `staff_absent` to the Scheduling Agent) and runs that agent. To add an agent, register its `handle_event` function in `AGENTS` and its event types in `ROUTES`.
+
+**2. Clash check for stock events.** After the Inventory Agent has handled a `stock_low` or `shelf_observation` event (even if it skipped because an order already exists), the Orchestrator checks each product that was looked at against upcoming bookings. Plain Python rules, no AI:
+
+1. Take the product's `current_qty`. Incoming purchase orders are NOT counted, because they have not arrived.
+2. Find `booked` appointments that start within `LOOKAHEAD_DAYS` (3) whose service uses the product (`service_products.qty_per_service`), in start-time order.
+3. Walk through them with a running stock number. If the stock covers an appointment, subtract what it needs. If not, that appointment is in clash (and nothing is subtracted for it).
+4. For each clash it proposes a hold: an `agent_actions` row (`orchestrator`, `hold_appointment`, medium risk, `awaiting_approval`), a `pending` approval and one `decision_log` row with the real numbers (outcome `clash found, hold proposed, waiting for approval`). **The appointment is not changed.** If that appointment already has a pending hold proposal, no second one is made (the log says `clash found, hold already proposed`).
+
+`approve()` on a hold changes the appointment to `held` (refused if it is no longer `booked`). `reject()` changes nothing and logs the reason. Ollama only writes a short explanation after the real numbers; a template sentence is used if it fails.
+
+If an agent crashes, the Orchestrator marks the event `failed` and writes the reason to `decision_log`. Tests:
+
+```powershell
+python -m backend.tests.test_orchestrator          # offline, no database writes
+python -m backend.tests.test_orchestrator_agent    # live: uses your database, restores everything afterwards
 ```
