@@ -42,8 +42,9 @@ MAX_HOLDS_PER_EVENT = 3   # at most 3 hold proposals per event (earliest booking
 ROUTES = {
     "stock_low": ["inventory_agent"],
     "shelf_observation": ["inventory_agent"],
-    "staff_absent": ["scheduling_agent"],
+    "staff_absent": ["scheduling_agent", "cx_agent"],    # replacements, then notices for the affected customers
     "complaint_received": ["quality_agent", "cx_agent"],
+    "queue_overload": ["scheduling_agent", "cx_agent"],  # shifts, then delay notices for the affected customers
 }
 
 # agent name -> the function that handles ONE event that is already marked 'processing'.

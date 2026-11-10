@@ -95,8 +95,9 @@ Enum `event_type`: `shelf_observation`, `stock_low`, `booking_created`, `staff_a
 
 **`queue_overload`** (source `simulator`)
 ```json
-{ "waiting_count": 7, "capacity": 4, "avg_wait_minutes": 28 }
+{ "waiting_count": 7, "capacity": 4, "avg_wait_minutes": 28, "time": "ISO8601 (optional)" }
 ```
+`time` is optional: it is the moment the overload was seen, and the Scheduling Agent moves the next booked appointments that start after it. If it is missing, the event's `created_at` is used.
 
 ## Seed data
 

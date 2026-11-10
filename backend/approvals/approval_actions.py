@@ -13,6 +13,12 @@ Two functions, which work for ALL agents (the action's tool_called decides what 
                                      reject  -> the appointment is NOT changed.
   draft_reply (CX Agent):            approve -> the ticket is marked 'resolved'. NOTHING is sent to the customer.
                                      reject  -> nothing changes, the reason is logged.
+  raise_audit_flag (Inventory):      approve -> the flag is marked resolved. The stock number is NOT changed.
+                                     reject  -> nothing changes, the reason is logged.
+  shift_appointment (Scheduling):    approve -> the appointment moves to the new time (refused if it changed or the
+                                     stylist became busy). reject -> the appointment is NOT changed.
+  draft_customer_notice (CX Agent):  approve -> the notice is approved. NOTHING is sent to the customer.
+                                     reject  -> nothing changes, the reason is logged.
   suggest_refund (CX Agent):         approve -> the ticket is marked 'resolved' with the approved amount in its notes.
                                      (No money moves: the system only records the manager's decision.)
                                      reject  -> nothing changes, the reason is logged.
@@ -24,10 +30,11 @@ the approval row is switched first. That "claims" it: a second click on the same
 approval is refused instead of being applied twice.
 """
 
+from backend.agents.scheduling_agent import parse_dt
 from backend.db import add_decision_log, now_iso, supabase
 from backend.tools.cx_tools import get_ticket, resolve_ticket, restore_ticket
 from backend.tools.orchestrator_tools import hold_appointment, release_hold
-from backend.tools.scheduling_tools import get_appointment, reassign_staff
+from backend.tools.scheduling_tools import get_appointment, reassign_staff, shift_appointment
 
 
 def _load(approval_id: str, decided_by: str):
@@ -72,6 +79,8 @@ def approve(approval_id: str, decided_by: str) -> dict:
         return _approve_reassignment(approval_id, decided_by, action)
     if action["tool_called"] == "hold_appointment":
         return _approve_hold(approval_id, decided_by, action)
+    if action["tool_called"] == "shift_appointment":
+        return _approve_shift(approval_id, decided_by, action)
     if action["tool_called"] in SIMPLE_TOOLS:
         return _approve_simple(approval_id, decided_by, action)
 
@@ -235,10 +244,18 @@ def _reject_hold(approval_id: str, decided_by: str, action: dict, reason: str) -
 # Proposals that only record a decision (and maybe resolve a ticket)
 # ----------------------------------------------------------------------------
 
-# tool_called -> (outcome when approved, outcome when rejected, what it is called in the log)
+# tool_called -> (outcome when approved, outcome when rejected, what it is called in the log, closing sentence)
 SIMPLE_TOOLS = {
-    "draft_reply": ("reply approved, ticket resolved", "reply rejected", "the draft reply"),
-    "suggest_refund": ("refund approved, ticket resolved", "refund rejected", "the suggested refund"),
+    "draft_reply": ("reply approved, ticket resolved", "reply rejected", "the draft reply",
+                    " The ticket is now resolved. Nothing was sent to the customer."),
+    "suggest_refund": ("refund approved, ticket resolved", "refund rejected", "the suggested refund",
+                       " The ticket is now resolved. Nothing was sent to the customer."),
+    "raise_audit_flag": ("audit flag approved and resolved", "audit flag rejected", "the audit flag",
+                         " The flag is resolved. The stock level was NOT changed."),
+    "draft_customer_notice": ("customer notice approved (not sent)", "customer notice rejected", "the customer notice",
+                              " Nothing was sent to the customer."),
+    # (an approved shift is carried out by _approve_shift below; a rejected one uses _reject_simple)
+    "shift_appointment": ("shift approved and applied", "shift rejected", "the appointment shift", ""),
 }
 
 
@@ -253,7 +270,7 @@ def _ticket_notes(action: dict, decided_by: str) -> str:
 
 def _approve_simple(approval_id: str, decided_by: str, action: dict) -> dict:
     """Approve a proposal that only records a decision. If it belongs to a ticket, the ticket is resolved."""
-    approved_outcome, _, name = SIMPLE_TOOLS[action["tool_called"]]
+    approved_outcome, _, name, closing = SIMPLE_TOOLS[action["tool_called"]]
     ticket_id = action["input"].get("ticket_id")
 
     # Resolve the ticket FIRST. If the approval then fails, the ticket is put back.
@@ -275,8 +292,7 @@ def _approve_simple(approval_id: str, decided_by: str, action: dict) -> dict:
                   .eq("id", action["id"]).execute().data[0])
     log_row = add_decision_log(
         action["event_id"], [action["agent_name"]],
-        f"Manager {decided_by} approved {name}." + (" The ticket is now resolved." if ticket_id else "")
-        + " Nothing was sent to the customer.",
+        f"Manager {decided_by} approved {name}." + closing,
         approved_outcome,
     )
     return {"approval": approval_row, "agent_action": action_row, "decision_log": log_row, "ticket": ticket_row}
@@ -284,7 +300,7 @@ def _approve_simple(approval_id: str, decided_by: str, action: dict) -> dict:
 
 def _reject_simple(approval_id: str, decided_by: str, action: dict, reason: str) -> dict:
     """Reject it: nothing changes (the ticket stays as it is). Only the reason is recorded."""
-    _, rejected_outcome, name = SIMPLE_TOOLS[action["tool_called"]]
+    _, rejected_outcome, name, _closing = SIMPLE_TOOLS[action["tool_called"]]
     approval_row = _decide(approval_id, "rejected", decided_by, reason)
     action_row = supabase.table("agent_actions").update({"status": "rejected"}).eq("id", action["id"]).execute().data[0]
     log_row = add_decision_log(
@@ -294,3 +310,44 @@ def _reject_simple(approval_id: str, decided_by: str, action: dict, reason: str)
     ticket_id = action["input"].get("ticket_id")
     return {"approval": approval_row, "agent_action": action_row, "decision_log": log_row,
             "ticket": get_ticket(ticket_id) if ticket_id else None}
+
+
+# ----------------------------------------------------------------------------
+# Scheduling Agent proposals to move an appointment later (tool_called = 'shift_appointment')
+# ----------------------------------------------------------------------------
+
+def _approve_shift(approval_id: str, decided_by: str, action: dict) -> dict:
+    """Carry out an approved shift: the appointment moves to its new time (same stylist)."""
+    info = action["input"]
+
+    # The proposal was made some time ago. The appointment must still be as the agent saw it.
+    appointment = get_appointment(info["appointment_id"])
+    if not appointment:
+        raise ValueError("the appointment no longer exists, so it cannot be moved")
+    if appointment["status"] not in ("booked", "held"):
+        raise ValueError(f"the appointment is now '{appointment['status']}', so it cannot be moved")
+    if parse_dt(appointment["start_time"]) != parse_dt(info["old_start"]):
+        raise ValueError("the appointment time was already changed since this was proposed")
+
+    # Move it FIRST. If the stylist became busy in the meantime, the database refuses and we stop here
+    # with the approval still pending (nothing is half done).
+    appointment_row = shift_appointment(info["appointment_id"], info["new_start"], info["new_end"])
+
+    try:
+        approval_row = _decide(approval_id, "approved", decided_by)
+    except Exception:
+        # Someone else decided at the same moment: put the appointment back.
+        shift_appointment(info["appointment_id"], info["old_start"], info["old_end"])
+        raise
+
+    result = {**(action.get("result") or {}), "applied": True}
+    action_row = (supabase.table("agent_actions").update({"status": "executed", "result": result})
+                  .eq("id", action["id"]).execute().data[0])
+    log_row = add_decision_log(
+        action["event_id"], [action["agent_name"]],
+        f"Manager {decided_by} approved moving the {info['service']} with {info['staff_name']} "
+        f"{info['minutes']} minutes later ({info['old_start']} to {info['new_start']}). The appointment was changed.",
+        SIMPLE_TOOLS["shift_appointment"][0],
+    )
+    return {"approval": approval_row, "appointment": appointment_row, "agent_action": action_row,
+            "decision_log": log_row}

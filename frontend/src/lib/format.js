@@ -68,6 +68,25 @@ export function describeAction(action, products = {}) {
       detail: `Under the ${input.basis}, because ${(input.reasons || []).join(' and ')}. Only a manager can decide this. Approving records your decision and resolves the ticket.`,
     }
   }
+  if (action.tool_called === 'raise_audit_flag') {
+    return {
+      title: `Check the stock count of ${input.sku} by hand`,
+      detail: `The camera counted ${input.observed_count} on the shelf, but the database says ${input.db_qty} (difference ${input.difference > 0 ? '+' : ''}${input.difference}). Approving marks the flag resolved. The stock number is NOT changed.`,
+    }
+  }
+  if (action.tool_called === 'shift_appointment') {
+    return {
+      title: `Move the ${input.service} with ${input.staff_name} from ${fmtDateTime(input.old_start)} to ${fmtDateTime(input.new_start)}`,
+      detail: `${input.minutes} minutes later, because the waiting area is overloaded (${input.waiting_count} waiting). The stylist has no other booking in that time. The appointment changes only when you approve.`,
+    }
+  }
+  if (action.tool_called === 'draft_customer_notice') {
+    const reason = input.kind === 'delay' ? 'the delay' : 'the change of stylist'
+    return {
+      title: `Tell the customer about ${reason} for the ${input.service}`,
+      detail: `Draft: "${result.draft_text}" Nothing is sent to the customer, even if you approve.`,
+    }
+  }
   return { title: action.tool_called, detail: '' }
 }
 
@@ -79,4 +98,7 @@ export const PROPOSAL_OUTCOME = {
   // A complaint writes ONE log row that explains both its reply and its refund suggestion.
   draft_reply: 'complaint handled, waiting for approval',
   suggest_refund: 'complaint handled, waiting for approval',
+  raise_audit_flag: 'audit flag proposed, waiting for approval',
+  shift_appointment: 'shift proposed, waiting for approval',
+  draft_customer_notice: 'customer notice drafted, waiting for approval',
 }

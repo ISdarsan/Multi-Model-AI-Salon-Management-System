@@ -174,9 +174,11 @@ def cap():
 
 def routing():
     print("\n== 7. routing ==")
-    check("stock_low and shelf_observation -> inventory_agent, staff_absent -> scheduling_agent (unchanged)",
+    check("stock_low and shelf_observation -> inventory_agent, staff_absent -> scheduling_agent first (unchanged)",
           orch.ROUTES["stock_low"] == ["inventory_agent"] and orch.ROUTES["shelf_observation"] == ["inventory_agent"]
-          and orch.ROUTES["staff_absent"] == ["scheduling_agent"])
+          and orch.ROUTES["staff_absent"][0] == "scheduling_agent")
+    check("staff_absent and queue_overload -> scheduling_agent THEN cx_agent (the CX Agent drafts the notices)",
+          orch.ROUTES["staff_absent"] == ["scheduling_agent", "cx_agent"] and orch.ROUTES["queue_overload"] == ["scheduling_agent", "cx_agent"])
     check("complaint_received -> quality_agent THEN cx_agent", orch.ROUTES["complaint_received"] == ["quality_agent", "cx_agent"])
     check("is_routed is True for routed types", all(orch.is_routed({"type": t}) for t in orch.ROUTES))
     check("an unrouted type (booking_created) is NOT routed, so the worker skips it",
@@ -187,7 +189,8 @@ def routing():
         "status": "handled", "results": [{"sku": "COL-6N", "outcome": "draft PO created, waiting for approval"}]}
     fake_scheduling = lambda ev: handled.append(("scheduling", ev["id"])) or {
         "status": "handled", "results": [{"label": "Men's Cut 09:30", "outcome": "reassignment proposed, waiting for approval"}]}
-    orch.AGENTS = {"inventory_agent": fake_inventory, "scheduling_agent": fake_scheduling}
+    fake_cx = lambda ev, context: handled.append(("cx", ev["id"])) or {"status": "handled", "results": []}
+    orch.AGENTS = {"inventory_agent": fake_inventory, "scheduling_agent": fake_scheduling, "cx_agent": fake_cx}
 
     print("\n== 8. the clash check runs after the Inventory Agent ==")
     reset(2, [booking("a1", 24, 2), booking("a2", 26, 2)])
@@ -212,8 +215,9 @@ def routing():
 
     reset(2, [booking("a1", 24, 2), booking("a2", 26, 2)])
     summary = orch.handle_event({"id": "ev-2", "type": "staff_absent", "payload": {}})
-    check("staff_absent goes to the Scheduling Agent, with no clash check",
-          ("scheduling", "ev-2") in handled and summary["routed_to"] == "scheduling_agent" and inserted("tool_called") == [])
+    check("staff_absent goes to the Scheduling Agent then the CX Agent, with no clash check",
+          ("scheduling", "ev-2") in handled and ("cx", "ev-2") in handled and summary["routed_to"] == "scheduling_agent + cx_agent"
+          and inserted("tool_called") == [])
 
     print("\n== 9. failures ==")
     def crash(ev): raise RuntimeError("boom, the agent crashed")

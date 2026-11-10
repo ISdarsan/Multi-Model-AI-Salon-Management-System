@@ -102,3 +102,42 @@ def reassign_staff(appointment_id: str, new_staff_id: str) -> dict:
     if not rows:
         raise ValueError(f"appointment {appointment_id} not found")
     return rows[0]
+
+
+def get_next_booked_appointments(from_iso: str, limit: int) -> list:
+    """
+    The next `limit` 'booked' appointments that start at or after from_iso (all stylists), earliest first.
+    Each comes with its service name and duration.
+    """
+    return (
+        supabase.table("appointments")
+        .select("*, services(name, duration_minutes)")
+        .eq("status", "booked")
+        .gte("start_time", from_iso)
+        .order("start_time")
+        .order("id")          # same start time (different stylists): keep a fixed order
+        .limit(limit)
+        .execute()
+        .data
+    )
+
+
+def shift_appointment(appointment_id: str, new_start_iso: str, new_end_iso: str) -> dict:
+    """
+    Move an appointment to a new time (same stylist). The ONLY place a shift is applied, and only after a
+    manager approves. If the stylist is already busy then, the database refuses (double-booking protection)
+    and we raise a clear error.
+    """
+    try:
+        rows = (
+            supabase.table("appointments")
+            .update({"start_time": new_start_iso, "end_time": new_end_iso})
+            .eq("id", appointment_id)
+            .execute()
+            .data
+        )
+    except Exception as error:
+        raise ValueError(f"could not shift appointment {appointment_id}: {error}")
+    if not rows:
+        raise ValueError(f"appointment {appointment_id} not found")
+    return rows[0]

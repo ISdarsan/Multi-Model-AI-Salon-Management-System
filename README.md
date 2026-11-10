@@ -68,9 +68,9 @@ begin;
 alter table public.decision_log disable trigger decision_log_no_update_delete;
 delete from public.decision_log
   where event_id in (select id from public.events
-                    where source in ('inventory_test', 'worker_test', 'scheduling_test', 'orchestrator_test', 'dashboard_test', 'complaint_test'));
+                    where source in ('inventory_test', 'worker_test', 'scheduling_test', 'orchestrator_test', 'dashboard_test', 'complaint_test', 'audit_queue_test'));
 alter table public.decision_log enable trigger decision_log_no_update_delete;
-delete from public.events where source in ('inventory_test', 'worker_test', 'scheduling_test', 'orchestrator_test', 'dashboard_test', 'complaint_test');
+delete from public.events where source in ('inventory_test', 'worker_test', 'scheduling_test', 'orchestrator_test', 'dashboard_test', 'complaint_test', 'audit_queue_test');
 commit;
 ```
 
@@ -183,4 +183,19 @@ The wording of the draft reply is the only thing the AI writes (Ollama; a templa
 ```powershell
 python -m backend.tests.test_cx_quality      # offline, no database writes
 python -m backend.tests.test_complaint_flow  # live: uses your database. Stop the worker first.
+```
+
+## Shelf audit and waiting-area scenarios (scenarios 4 and 5, plus customer notices)
+
+**Scenario 4: shelf audit** (Inventory Agent). On every `shelf_observation` event the agent compares each product's observed count with `stock_levels.current_qty`. If they differ by **more than 1**, it proposes a **medium**-risk `raise_audit_flag` (a manager should count by hand). **The stock is never changed**; approving the flag only marks it resolved. (The reorder rules still run as before, and use the database stock.)
+
+**Scenario 5: waiting area overloaded** (`queue_overload` event: `waiting_count`, optional `capacity`, `avg_wait_minutes`, `time`; see `docs/SCHEMA.md`).
+- The **Scheduling Agent** proposes moving the next `MAX_SHIFTS` (3) booked appointments (counted from the event's `time`, or its creation time) later: **30 minutes** if 3 or more people are over capacity (default capacity 4) or the average wait is already 30 minutes or more, otherwise **15**. A shift is only proposed if the same stylist has no overlapping appointment (booked, held or in progress) and the appointment still ends within the shift. If 30 minutes does not fit it tries 15; if nothing fits, the log says `no safe shift found, manager must decide`. Medium risk, tool `shift_appointment`. Each proposal is checked against the appointments as they are now, so they can be approved in any order.
+- The **CX Agent** drafts a notice (medium risk, `draft_customer_notice`) for each affected customer. Walk-ins have no customer on file, so they get none. The same notice is drafted when a stylist is absent and an appointment is proposed to move to another stylist (scenario 2).
+
+**Approving:** a shift moves the appointment (refused if it changed since, or the stylist became busy); an audit flag or a notice is just marked approved. **Nothing is ever sent to a customer.** Rejecting changes nothing and logs the reason.
+
+```powershell
+python -m backend.tests.test_audit_queue        # offline, no database writes
+python -m backend.tests.test_audit_queue_flow   # live: uses your database. Stop the worker first.
 ```

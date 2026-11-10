@@ -15,7 +15,9 @@ Run it from the project root:   python -m backend.agents.inventory_agent
 import math
 import os
 
+from backend.ai import short_explanation
 from backend.db import add_decision_log, claim_event, supabase
+from backend.proposals import pending_input_values, propose
 from backend.tools.inventory_tools import (
     create_draft_po,
     get_open_purchase_order,
@@ -29,6 +31,9 @@ EVENT_TYPES = ["stock_low", "shelf_observation"]  # the events this agent cares 
 SALES_WINDOW_DAYS = 7      # look at the last 7 days of sales
 SAFETY_DAYS = 2            # reorder if stock will run out within lead time + 2 days
 COVER_DAYS = 14            # a new order should cover lead time + 14 days of sales
+
+AUDIT_TOLERANCE = 1        # a shelf count that differs from the database by MORE than this is suspicious
+AUDIT_OUTCOME = "audit flag proposed, waiting for approval"
 
 
 # ----------------------------------------------------------------------------
@@ -273,6 +278,73 @@ def products_to_check(event: dict):
 
 
 # ----------------------------------------------------------------------------
+# 4b. Shelf audit (scenario 4): does the camera agree with the database?
+# ----------------------------------------------------------------------------
+
+def audit_difference(observed_count: int, db_qty: int):
+    """
+    Compare what the camera counted on the shelf with what the database says is in stock.
+    Returns (difference, suspicious). It is suspicious only if they differ by MORE than AUDIT_TOLERANCE.
+    """
+    difference = observed_count - db_qty
+    return difference, abs(difference) > AUDIT_TOLERANCE
+
+
+def audit_shelf(event: dict) -> list:
+    """
+    For every product in a shelf_observation event, compare the observed count with stock_levels.
+    If they differ by more than 1, PROPOSE an audit flag for a manager (medium risk, 'raise_audit_flag').
+    This NEVER changes the stock: the manager reviews first.
+    """
+    payload = event["payload"] or {}
+    pending = pending_input_values("raise_audit_flag", "sku")   # products that already have a flag waiting
+    results = []
+
+    for obs in payload.get("observations") or []:
+        stock = get_stock(sku=obs["sku"])
+        if not stock:
+            continue   # unknown products are already reported by products_to_check
+        difference, suspicious = audit_difference(obs["observed_count"], stock["current_qty"])
+        if not suspicious:
+            continue
+
+        sku = obs["sku"]
+        if sku in pending:
+            why = (f"{sku}: the shelf shows {obs['observed_count']} but the database says {stock['current_qty']}, "
+                   "but an audit flag for this product is already waiting for approval, so no new one was raised.")
+            add_decision_log(event["id"], [AGENT_NAME], why, "audit flag already proposed")
+            results.append({"label": f"audit {sku}", "outcome": "audit flag already proposed", "detail": why})
+            continue
+
+        # The real numbers always come first (written by code); the AI only adds a short explanation.
+        facts = (f"Shelf audit for {sku}: the camera counted {obs['observed_count']} but the database says "
+                 f"{stock['current_qty']} (difference {difference:+d}, more than {AUDIT_TOLERANCE}). ")
+        template = ("The shelf and the database disagree, so one of them is wrong. A manager should count the "
+                    "stock by hand before any stock number is changed.")
+        prompt = (
+            "Write exactly two short plain-English sentences explaining why a manager should check the stock by "
+            "hand. Reply with ONLY the two sentences, no introduction. Use only these facts and do not invent anything."
+            "\n"
+            f"Product: {sku} ({stock['name']})\n"
+            f"Counted on the shelf by the camera: {obs['observed_count']}\n"
+            f"Units in the database: {stock['current_qty']}"
+        )
+        reasoning = facts + short_explanation(prompt, template)
+
+        action, approval = propose(
+            event["id"], AGENT_NAME, "raise_audit_flag", "medium",
+            {"sku": sku, "product_id": stock["product_id"], "observed_count": obs["observed_count"],
+             "db_qty": stock["current_qty"], "difference": difference, "image_path": payload.get("image_path")},
+            {"proposed": True, "stock_changed": False},
+            reasoning, AUDIT_OUTCOME, [AGENT_NAME],
+        )
+        pending.add(sku)
+        results.append({"label": f"audit {sku}", "outcome": AUDIT_OUTCOME, "detail": reasoning,
+                        "agent_action_id": action["id"], "approval_id": approval["id"]})
+    return results
+
+
+# ----------------------------------------------------------------------------
 # 5. Handling one event, and running the agent
 # ----------------------------------------------------------------------------
 
@@ -300,6 +372,10 @@ def handle_event(event: dict) -> dict:
             why = "Ignored: " + "; ".join(notes) + "."
             add_decision_log(event["id"], [AGENT_NAME], why, "some items ignored")
             results.append({"sku": None, "outcome": "some items ignored", "detail": why})
+
+        # Scenario 4: a shelf photo may disagree with the database. That is checked for every product seen.
+        if event["type"] == "shelf_observation":
+            results.extend(audit_shelf(event))
 
         set_event_status(event["id"], "handled")
         return {"event_id": event["id"], "type": event["type"], "status": "handled", "results": results}

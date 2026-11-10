@@ -1,6 +1,9 @@
 """
 cx_agent.py - the Customer Experience (CX) Agent.
 
+It also drafts notices for customers (see handle_notices at the bottom) when their appointment is proposed
+to move, because a stylist is absent (`staff_absent`) or the waiting area is overloaded (`queue_overload`).
+
 For a complaint (a `complaint_received` event) it:
   1. classifies the complaint with keyword rules (category + sentiment) and saves that on the feedback row,
   2. opens a ticket (priority from the rating),
@@ -19,9 +22,10 @@ becomes final until a manager approves it (backend/approvals/approval_actions.py
 
 import re
 
+from backend.agents.scheduling_agent import parse_dt
 from backend.ai import short_explanation
 from backend.db import add_decision_log
-from backend.proposals import propose, record_executed
+from backend.proposals import pending_input_values, propose, record_executed
 from backend.tools.cx_tools import (
     get_appointment_details,
     get_feedback,
@@ -41,6 +45,8 @@ DELAY_COMPENSATION_PERCENT = 10
 
 # The one decision_log outcome used for a handled complaint. (The dashboard uses it to show the reasoning.)
 COMPLAINT_OUTCOME = "complaint handled, waiting for approval"
+# The decision_log outcome for each drafted customer notice.
+NOTICE_OUTCOME = "customer notice drafted, waiting for approval"
 
 # ----------------------------------------------------------------------------
 # 1. The rules (plain Python, no AI, no database)
@@ -245,7 +251,88 @@ def handle_complaint(event: dict, context: dict) -> dict:
 
 
 # ----------------------------------------------------------------------------
-# 4. The entry point the Orchestrator calls
+# 4. Customer notices (scenarios 2 and 5)
+# ----------------------------------------------------------------------------
+
+def when_text(iso: str) -> str:
+    """'2026-11-12T09:30:00+00:00' -> '09:30 UTC on 12 Nov'."""
+    moment = parse_dt(iso)
+    return f"{moment:%H:%M} UTC on {moment:%d %b}"
+
+
+def notice_text(kind: str, item: dict) -> str:
+    """
+    A short, polite notice for ONE customer. The AI only writes the wording; a template is used if it fails.
+    kind 'delay'        -> the appointment was moved later because the salon is busy
+    kind 'reassignment' -> the appointment is now with another stylist because the usual one is unavailable
+    """
+    if kind == "delay":
+        template = (f"We are sorry: because the salon is very busy, your {item['service']} has been moved from "
+                    f"{when_text(item['old_start'])} to {when_text(item['new_start'])}. Thank you for your patience.")
+        facts = (f"Service: {item['service']}\nOriginal time: {when_text(item['old_start'])}\n"
+                 f"New time ({item['minutes']} minutes later): {when_text(item['new_start'])}\nReason: the salon is very busy")
+    else:
+        template = (f"Your {item['service']} on {when_text(item['start_time'])} will now be with {item['new_staff']} "
+                    f"because {item['old_staff']} is not available. The time of your appointment stays the same.")
+        facts = (f"Service: {item['service']}\nTime (unchanged): {when_text(item['start_time'])}\n"
+                 f"New stylist: {item['new_staff']}\nReason: the usual stylist {item['old_staff']} is not available")
+    prompt = ("Write a short, polite notice (at most three sentences) from a salon to a customer about a change to "
+              "their appointment. Do NOT invent facts and do NOT offer compensation. Reply with ONLY the message, "
+              "no introduction.\n" + facts)
+    return short_explanation(prompt, template)
+
+
+def handle_notices(event: dict, context: dict) -> dict:
+    """
+    Draft a notice (MEDIUM risk, 'draft_customer_notice') for each customer whose appointment another agent
+    proposed to change. The proposals come in `context` (the Scheduling Agent put them there).
+    Walk-ins have no customer on file, so they get no notice. NOTHING is sent to anyone.
+    """
+    if event["type"] == "queue_overload":
+        kind, items = "delay", context.get("shifts", [])
+    else:
+        kind, items = "reassignment", context.get("reassignments", [])
+
+    pending = pending_input_values("draft_customer_notice", "appointment_id")   # notices already waiting
+    results, walk_ins = [], 0
+    for item in items:
+        service = item["service"]
+        if not item.get("customer_id"):
+            walk_ins += 1
+            continue
+        if item["appointment_id"] in pending:
+            results.append({"label": f"notice {service}", "outcome": "notice already proposed", "detail": "a notice for this appointment is already waiting"})
+            continue
+
+        text = notice_text(kind, item)
+        if kind == "delay":
+            about = (f"Delay notice for the customer of the {service} (proposed to move {item['minutes']} minutes later, "
+                     f"{when_text(item['old_start'])} to {when_text(item['new_start'])}) because the waiting area is overloaded.")
+        else:
+            about = (f"Notice for the customer of the {service} on {when_text(item['start_time'])}: the appointment is proposed to "
+                     f"move from {item['old_staff']} to {item['new_staff']} because {item['old_staff']} is absent.")
+        reasoning = about + " It only applies if the manager approves the change. Nothing was sent to the customer."
+        action, approval = propose(
+            event["id"], AGENT_NAME, "draft_customer_notice", "medium",
+            {"appointment_id": item["appointment_id"], "customer_id": item["customer_id"], "kind": kind, "service": service,
+             "old_start": item.get("old_start") or item.get("start_time"), "new_start": item.get("new_start"),
+             "old_staff": item.get("old_staff"), "new_staff": item.get("new_staff")},
+            {"draft_text": text, "sent": False},
+            reasoning, NOTICE_OUTCOME, ["cx_agent", "scheduling_agent"],
+        )
+        results.append({"label": f"notice {service}", "outcome": NOTICE_OUTCOME, "detail": text,
+                        "appointment_id": item["appointment_id"], "agent_action_id": action["id"],
+                        "approval_id": approval["id"]})
+
+    if walk_ins:
+        why = f"{walk_ins} affected appointment(s) belong to walk-ins with no customer on file, so no notice was drafted for them."
+        add_decision_log(event["id"], ["cx_agent", "scheduling_agent"], why, "no notice needed for walk-ins")
+        results.append({"label": "walk-ins", "outcome": "no notice needed for walk-ins", "detail": why})
+    return {"status": "handled", "results": results}
+
+
+# ----------------------------------------------------------------------------
+# 5. The entry point the Orchestrator calls
 # ----------------------------------------------------------------------------
 
 def handle_event(event: dict, context: dict = None) -> dict:
@@ -258,4 +345,6 @@ def handle_event(event: dict, context: dict = None) -> dict:
         context = {}
     if event["type"] == "complaint_received":
         return handle_complaint(event, context)
+    if event["type"] in ("queue_overload", "staff_absent"):
+        return handle_notices(event, context)
     raise ValueError(f"the CX Agent does not handle events of type '{event['type']}'")
