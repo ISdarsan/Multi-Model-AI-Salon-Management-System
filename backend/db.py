@@ -31,6 +31,23 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def claim_event(event_id: str) -> bool:
+    """
+    Switch an event from 'new' to 'processing', but ONLY if it is still 'new'.
+    Returns True if we got it, False if someone else already took it. This is what
+    makes sure an event can never be handled twice.
+    """
+    claimed = (
+        supabase.table("events")
+        .update({"status": "processing"})
+        .eq("id", event_id)
+        .eq("status", "new")
+        .execute()
+        .data
+    )
+    return bool(claimed)
+
+
 def add_decision_log(event_id: str, agents_involved: list, reasoning: str, outcome: str) -> dict:
     """
     Add ONE row to decision_log (the permanent record of what happened and why).

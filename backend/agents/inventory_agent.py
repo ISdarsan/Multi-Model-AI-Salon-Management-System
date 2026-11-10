@@ -15,7 +15,7 @@ Run it from the project root:   python -m backend.agents.inventory_agent
 import math
 import os
 
-from backend.db import add_decision_log, supabase
+from backend.db import add_decision_log, claim_event, supabase
 from backend.tools.inventory_tools import (
     create_draft_po,
     get_open_purchase_order,
@@ -280,14 +280,12 @@ def set_event_status(event_id: str, status: str):
     supabase.table("events").update({"status": status}).eq("id", event_id).execute()
 
 
-def process_event(event: dict):
-    """Handle one event from start to finish. Returns a summary, or None if someone else took it."""
-    # Claim the event: only switch new -> processing if it is STILL new.
-    claimed = (supabase.table("events").update({"status": "processing"})
-               .eq("id", event["id"]).eq("status", "new").execute().data)
-    if not claimed:
-        return None
-
+def handle_event(event: dict) -> dict:
+    """
+    Do the agent's work for ONE event that is already marked 'processing'.
+    The caller (run() below, or backend/worker.py) must claim the event first.
+    Always returns a summary; if something goes wrong the event is marked 'failed'.
+    """
     try:
         stocks, notes = products_to_check(event)
         results = [check_product(event, stock) for stock in stocks]
@@ -316,6 +314,13 @@ def process_event(event: dict):
             pass  # if even the log fails, the 'failed' status is still set
         return {"event_id": event["id"], "type": event["type"], "status": "failed", "error": str(error),
                 "results": []}
+
+
+def process_event(event: dict):
+    """Claim one event and handle it. Returns a summary, or None if someone else took it."""
+    if not claim_event(event["id"]):
+        return None
+    return handle_event(event)
 
 
 def run(event_ids: list = None) -> list:

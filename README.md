@@ -72,3 +72,19 @@ alter table public.decision_log enable trigger decision_log_no_update_delete;
 delete from public.events where source = 'inventory_test';
 commit;
 ```
+
+## Run the server and the worker
+
+Events flow like this: something sends `POST /events` to the **server**, the event is saved with status `new`, and the **worker** (`backend/worker.py`) notices it within 3 seconds and gives it to the right agent. Open **two terminals**, switch the Python environment on in each (`.venv\Scripts\Activate.ps1`), and run from the project root:
+
+```powershell
+# Terminal 1: the API server (needs API_KEY in .env)
+uvicorn backend.api.main:app --reload
+
+# Terminal 2: the worker (leave it running; press Ctrl+C to stop it cleanly)
+python -m backend.worker
+```
+
+The worker prints one line per thing it does, for example `14:05:12 event stock_low (COL-6N) -> inventory_agent -> draft PO created, waiting for approval`. Which agent handles which event type is the `ROUTES` dictionary at the top of `backend/worker.py`. Event types with no agent yet stay `new` and are reported once.
+
+Check the worker's rules without touching the database: `python -m backend.tests.test_worker`.
