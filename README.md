@@ -68,9 +68,9 @@ begin;
 alter table public.decision_log disable trigger decision_log_no_update_delete;
 delete from public.decision_log
   where event_id in (select id from public.events
-                    where source in ('inventory_test', 'worker_test', 'scheduling_test', 'orchestrator_test', 'dashboard_test', 'complaint_test', 'audit_queue_test'));
+                    where source in ('inventory_test', 'worker_test', 'scheduling_test', 'orchestrator_test', 'dashboard_test', 'complaint_test', 'audit_queue_test', 'scenario1_test', 'scenario2_test', 'scenario3_test', 'scenario4_test', 'scenario5_test'));
 alter table public.decision_log enable trigger decision_log_no_update_delete;
-delete from public.events where source in ('inventory_test', 'worker_test', 'scheduling_test', 'orchestrator_test', 'dashboard_test', 'complaint_test', 'audit_queue_test');
+delete from public.events where source in ('inventory_test', 'worker_test', 'scheduling_test', 'orchestrator_test', 'dashboard_test', 'complaint_test', 'audit_queue_test', 'scenario1_test', 'scenario2_test', 'scenario3_test', 'scenario4_test', 'scenario5_test');
 commit;
 ```
 
@@ -199,3 +199,22 @@ python -m backend.tests.test_complaint_flow  # live: uses your database. Stop th
 python -m backend.tests.test_audit_queue        # offline, no database writes
 python -m backend.tests.test_audit_queue_flow   # live: uses your database. Stop the worker first.
 ```
+
+## Scenario test runner (the acceptance test)
+
+`backend/scenarios/run_scenarios.py` runs all five cross-agent scenarios from `docs/ARCHITECTURE.md` (section 9) end to end on your real database, using temporary test data:
+
+1. Colour stock low + a colour service booked: clash detected, booking held, draft order, manager approves.
+2. A stylist is absent: reassignment proposed + a notice drafted for the affected customer, manager approves the reassignment.
+3. A customer complaint: ticket opened, service log checked, refund suggested, manager only.
+4. The shelf shows an empty slot but the database says stock exists: audit flag, no stock change.
+5. The waiting area is overloaded: appointments shifted + delay notices.
+
+For each scenario it sends the event, runs the Orchestrator (the same code the worker runs), checks the exact proposals and rows (it **fails loudly** if an expected proposal is missing), approves or rejects as the scenario says, checks the final state, measures the seconds from the event to the proposals, and cleans up everything except the append-only `decision_log` rows. It prints a PASS/FAIL table and saves it to `docs/SCENARIO_RESULTS.md`.
+
+```powershell
+# Stop the worker first (so it does not grab the test events), then from the project root:
+python -m backend.scenarios.run_scenarios
+```
+
+It exits with an error code if any scenario fails. Latency includes the local AI writing the explanations and drafts, so it depends on your computer and on Ollama already having the model loaded (the first run after a restart is slower). The 10-second target is reported next to the result but does not decide PASS or FAIL.
