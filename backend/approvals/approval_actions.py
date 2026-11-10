@@ -1,9 +1,14 @@
 """
 approval_actions.py - what happens when a manager approves or rejects a proposal.
 
-Two functions:
-  approve(approval_id, decided_by)          -> the draft order is approved and the action counts as executed
-  reject(approval_id, decided_by, reason)   -> the draft order is rejected and the reason is recorded
+Two functions, which work for BOTH agents (the action's tool_called decides what happens):
+  approve(approval_id, decided_by)          -> the proposal is carried out and the action counts as executed
+  reject(approval_id, decided_by, reason)   -> nothing is carried out and the reason is recorded
+
+  create_draft_po (Inventory Agent): approve -> the purchase order becomes 'approved'.
+                                     reject  -> the purchase order becomes 'rejected'.
+  reassign_staff (Scheduling Agent): approve -> the appointment moves to the new stylist.
+                                     reject  -> the appointment is NOT changed.
 
 Both also ADD a row to decision_log. Old decision_log rows are never edited or deleted.
 
@@ -13,6 +18,7 @@ approval is refused instead of being applied twice.
 """
 
 from backend.db import add_decision_log, now_iso, supabase
+from backend.tools.scheduling_tools import get_appointment, reassign_staff
 
 
 def _load(approval_id: str, decided_by: str):
@@ -53,6 +59,8 @@ def _decide(approval_id: str, status: str, decided_by: str, reason: str = None) 
 def approve(approval_id: str, decided_by: str) -> dict:
     """Approve a pending approval. Returns the rows that changed."""
     approval, action, po_id = _load(approval_id, decided_by)
+    if action["tool_called"] == "reassign_staff":
+        return _approve_reassignment(approval_id, decided_by, action)
 
     approval_row = _decide(approval_id, "approved", decided_by)
     po_row = None
@@ -75,6 +83,8 @@ def reject(approval_id: str, decided_by: str, reason: str) -> dict:
     if not reason or not reason.strip():
         raise ValueError("a reason is required when rejecting")
     approval, action, po_id = _load(approval_id, decided_by)
+    if action["tool_called"] == "reassign_staff":
+        return _reject_reassignment(approval_id, decided_by, action, reason.strip())
 
     approval_row = _decide(approval_id, "rejected", decided_by, reason.strip())
     po_row = None
@@ -89,3 +99,61 @@ def reject(approval_id: str, decided_by: str, reason: str) -> dict:
         "purchase order rejected",
     )
     return {"approval": approval_row, "purchase_order": po_row, "agent_action": action_row, "decision_log": log_row}
+
+
+# ----------------------------------------------------------------------------
+# Scheduling Agent proposals (tool_called = 'reassign_staff')
+# ----------------------------------------------------------------------------
+
+def _approve_reassignment(approval_id: str, decided_by: str, action: dict) -> dict:
+    """Carry out an approved reassignment: the appointment moves to the new stylist."""
+    info = action["input"]
+
+    # The proposal was made some time ago. Check the appointment is still as the agent saw it.
+    appointment = get_appointment(info["appointment_id"])
+    if not appointment:
+        raise ValueError("the appointment no longer exists, so it cannot be reassigned")
+    if appointment["status"] not in ("booked", "held"):
+        raise ValueError(f"the appointment is now '{appointment['status']}', so it cannot be reassigned")
+    if appointment["staff_id"] != info["old_staff_id"]:
+        raise ValueError("the appointment was already changed since this was proposed")
+
+    # Change the appointment FIRST. If the new stylist became busy in the meantime, the database
+    # refuses and we stop here with the approval still pending (nothing is half done).
+    appointment_row = reassign_staff(info["appointment_id"], info["new_staff_id"])
+
+    try:
+        approval_row = _decide(approval_id, "approved", decided_by)
+    except Exception:
+        # Someone else decided at the same moment: put the appointment back.
+        reassign_staff(info["appointment_id"], info["old_staff_id"])
+        raise
+
+    result = {**(action.get("result") or {}), "applied": True}
+    action_row = (supabase.table("agent_actions").update({"status": "executed", "result": result})
+                  .eq("id", action["id"]).execute().data[0])
+    log_row = add_decision_log(
+        action["event_id"], [action["agent_name"]],
+        f"Manager {decided_by} approved moving the {info['service']} on {info['start_time']} "
+        f"from {info['old_staff_name']} to {info['new_staff_name']}. The appointment was changed.",
+        "reassignment approved and applied",
+    )
+    return {"approval": approval_row, "appointment": appointment_row, "agent_action": action_row,
+            "decision_log": log_row}
+
+
+def _reject_reassignment(approval_id: str, decided_by: str, action: dict, reason: str) -> dict:
+    """A rejected reassignment changes nothing on the appointment. Only the reason is recorded."""
+    info = action["input"]
+
+    approval_row = _decide(approval_id, "rejected", decided_by, reason)
+    action_row = supabase.table("agent_actions").update({"status": "rejected"}).eq("id", action["id"]).execute().data[0]
+    log_row = add_decision_log(
+        action["event_id"], [action["agent_name"]],
+        f"Manager {decided_by} rejected moving the {info['service']} on {info['start_time']} "
+        f"from {info['old_staff_name']} to {info['new_staff_name']}. Reason: {reason}",
+        "reassignment rejected",
+    )
+    # The appointment is returned exactly as it is now, to show that it was not touched.
+    return {"approval": approval_row, "appointment": get_appointment(info["appointment_id"]),
+            "agent_action": action_row, "decision_log": log_row}

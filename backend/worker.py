@@ -13,7 +13,7 @@ import signal
 import time
 from datetime import datetime
 
-from backend.agents import inventory_agent
+from backend.agents import inventory_agent, scheduling_agent
 from backend.db import add_decision_log, claim_event, supabase
 
 # ----------------------------------------------------------------------------
@@ -24,12 +24,14 @@ from backend.db import add_decision_log, claim_event, supabase
 ROUTES = {
     "stock_low": "inventory_agent",
     "shelf_observation": "inventory_agent",
+    "staff_absent": "scheduling_agent",
 }
 
 # agent name -> the function that handles ONE event that is already marked 'processing'.
 # To add an agent later: write its handle_event function, add it here, add its types above.
 AGENTS = {
     "inventory_agent": inventory_agent.handle_event,
+    "scheduling_agent": scheduling_agent.handle_event,
 }
 
 POLL_SECONDS = 3       # how often to look for new events
@@ -89,7 +91,8 @@ def outcome_text(summary: dict) -> str:
     results = summary.get("results") or []
     if len(results) == 1:
         return results[0]["outcome"]
-    return "; ".join(f"{r['sku'] or '-'}: {r['outcome']}" for r in results) or "handled"
+    # Each result has a short name: a product sku (Inventory Agent) or a label (Scheduling Agent).
+    return "; ".join(f"{r.get('sku') or r.get('label') or '-'}: {r['outcome']}" for r in results) or "handled"
 
 
 # ----------------------------------------------------------------------------

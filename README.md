@@ -61,15 +61,16 @@ python -m backend.tests.test_inventory_agent
 
 Managers approve or reject with `backend/approvals/approval_actions.py` (`approve(approval_id, decided_by)` and `reject(approval_id, decided_by, reason)`).
 
-**Test leftovers:** `decision_log` can never be edited or deleted, and an event that has log rows cannot be deleted either. So the test cleans up purchase orders, actions and approvals, but leaves its events (`source = 'inventory_test'`) and their log rows. To remove them by hand, paste this into the Supabase SQL Editor. It switches the protection off for a moment, so only run it for test data:
+**Test leftovers:** `decision_log` can never be edited or deleted, and an event that has log rows cannot be deleted either. So the test cleans up purchase orders, actions and approvals, but leaves its events (`source = 'inventory_test'`) and their log rows (the other tests leave `worker_test` and `scheduling_test` events). To remove them by hand, paste this into the Supabase SQL Editor. It switches the protection off for a moment, so only run it for test data:
 
 ```sql
 begin;
 alter table public.decision_log disable trigger decision_log_no_update_delete;
 delete from public.decision_log
-  where event_id in (select id from public.events where source = 'inventory_test');
+  where event_id in (select id from public.events
+                    where source in ('inventory_test', 'worker_test', 'scheduling_test'));
 alter table public.decision_log enable trigger decision_log_no_update_delete;
-delete from public.events where source = 'inventory_test';
+delete from public.events where source in ('inventory_test', 'worker_test', 'scheduling_test');
 commit;
 ```
 
@@ -88,3 +89,25 @@ python -m backend.worker
 The worker prints one line per thing it does, for example `14:05:12 event stock_low (COL-6N) -> inventory_agent -> draft PO created, waiting for approval`. Which agent handles which event type is the `ROUTES` dictionary at the top of `backend/worker.py`. Event types with no agent yet stay `new` and are reported once.
 
 Check the worker's rules without touching the database: `python -m backend.tests.test_worker`.
+
+## Scheduling Agent
+
+`backend/agents/scheduling_agent.py` handles `staff_absent` events (payload: `staff_id`, `from`, `to`, `reason`, see `docs/SCHEMA.md`). All decisions are plain Python rules; Ollama only writes a short explanation (a template sentence is used if it fails). **The agent never changes an appointment itself.** It only proposes; a manager approves.
+
+For each of the absent stylist's `booked` or `held` appointments that start in the future and inside the absence window, a replacement must:
+- not be the absent stylist, and have `is_available = true`;
+- work that weekday, with the whole slot inside their shift (times are read in UTC);
+- have the skill the service needs (see `SERVICE_SKILLS` in `backend/tools/scheduling_tools.py`, edit it when you add a service);
+- have no overlapping `booked`, `held` or `in_progress` appointment.
+
+If several fit, the stylist with the fewest appointments that day wins (earlier proposals in the same event count). For each match the agent writes an `agent_actions` row (`reassign_staff`, medium risk, `awaiting_approval`), a `pending` approval and a `decision_log` row (outcome `reassignment proposed, waiting for approval`). If nobody fits, no proposal is made and `decision_log` says `no replacement found, manager must decide` with the reason for each stylist.
+
+`approve()` and `reject()` in `backend/approvals/approval_actions.py` work for both agents. Approving a reassignment moves the appointment to the new stylist; rejecting it changes nothing. If the appointment changed since the proposal, or the new stylist became busy, the approval is refused and stays pending.
+
+The worker sends `staff_absent` events to this agent. Tests:
+
+```powershell
+python -m backend.tests.test_scheduling_rules      # offline, no database writes
+python -m backend.tests.test_approval_actions      # offline, no database writes
+python -m backend.tests.test_scheduling_agent      # live: uses your database, restores appointments afterwards
+```
