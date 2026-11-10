@@ -1,10 +1,12 @@
 """
 main.py - a small FastAPI server for SalonOS.
 
-It has 3 endpoints:
-  GET  /health         -> says the server is running (no key needed)
-  POST /events         -> saves a new event in the Supabase `events` table (needs X-API-Key)
-  GET  /events/recent  -> returns the 20 newest events (needs X-API-Key)
+It has these endpoints:
+  GET  /health                    -> says the server is running (no key needed)
+  POST /events                    -> saves a new event in the Supabase `events` table (needs X-API-Key)
+  GET  /events/recent             -> returns the 20 newest events (needs X-API-Key)
+  POST /approvals/{id}/approve    -> a MANAGER approves a proposal (needs "Authorization: Bearer <token>")
+  POST /approvals/{id}/reject     -> a MANAGER rejects a proposal, with a reason (needs the same token)
 
 Start it from the project root:   uvicorn backend.api.main:app --reload
 Then open http://127.0.0.1:8000/docs to try it in your browser.
@@ -14,11 +16,16 @@ import os
 import secrets
 from enum import Enum
 from pathlib import Path
+from uuid import UUID
 
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from supabase import create_client
+
+# The SAME approve() and reject() functions the agents' tests use. The API only checks WHO is asking.
+from backend.approvals.approval_actions import approve, reject
 
 # ----------------------------------------------------------------------------
 # 1. Settings and the Supabase connection (same idea as hello_agent.py)
@@ -42,6 +49,15 @@ if not API_KEY:
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 app = FastAPI(title="SalonOS API")
+
+# CORS: lets the dashboard (running at localhost:5173) call this server from the browser.
+# Without this, the browser would block the dashboard's requests.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["Authorization", "Content-Type", "X-API-Key"],
+)
 
 
 # ----------------------------------------------------------------------------
@@ -115,3 +131,68 @@ def recent_events():
     except Exception as error:
         raise HTTPException(status_code=502, detail=f"Could not read events: {error}")
     return response.data
+
+
+# ----------------------------------------------------------------------------
+# 5. Manager approvals (used by the dashboard)
+# ----------------------------------------------------------------------------
+
+def require_manager(authorization: str | None = Header(default=None)) -> str:
+    """
+    Check the caller is a signed-in MANAGER and return their user id.
+
+    The dashboard sends:  Authorization: Bearer <the Supabase login token>
+      - no token or a bad/expired token -> 401
+      - a valid token but the role is not 'manager' -> 403
+    """
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Please sign in (missing Authorization: Bearer token)")
+    token = authorization[7:].strip()
+
+    # Ask Supabase whether this token is real and who it belongs to.
+    try:
+        user = supabase.auth.get_user(token).user
+    except Exception:
+        user = None
+    if not user:
+        raise HTTPException(status_code=401, detail="Your sign-in is not valid or has expired. Please sign in again.")
+
+    # The role lives in the profiles table. Only managers may approve or reject.
+    profile = supabase.table("profiles").select("role").eq("id", user.id).execute().data
+    if not profile or profile[0]["role"] != "manager":
+        raise HTTPException(status_code=403, detail="Only managers can approve or reject.")
+    return user.id
+
+
+class RejectIn(BaseModel):
+    """What the caller must send to reject: a reason (required)."""
+    reason: str = Field(min_length=1)
+
+
+def decide(function, *args) -> dict:
+    """Run approve() or reject() and turn its errors into clear HTTP errors."""
+    try:
+        changes = function(*args)
+    except PermissionError as error:
+        raise HTTPException(status_code=403, detail=str(error))
+    except ValueError as error:
+        message = str(error)
+        # "not found" -> 404. Anything else (already decided, appointment changed...) -> 409 conflict.
+        raise HTTPException(status_code=404 if "not found" in message else 409, detail=message)
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=f"Could not complete this: {error}")
+    return {"ok": True, "approval": changes["approval"], "outcome": changes["decision_log"]["outcome"]}
+
+
+@app.post("/approvals/{approval_id}/approve")
+def approve_approval(approval_id: UUID, manager_id: str = Depends(require_manager)):
+    """A manager approves a pending proposal. The action is carried out and logged."""
+    return decide(approve, str(approval_id), manager_id)
+
+
+@app.post("/approvals/{approval_id}/reject")
+def reject_approval(approval_id: UUID, body: RejectIn, manager_id: str = Depends(require_manager)):
+    """A manager rejects a pending proposal. Nothing is carried out, and the reason is logged."""
+    if not body.reason.strip():
+        raise HTTPException(status_code=422, detail="A reason is required when rejecting.")
+    return decide(reject, str(approval_id), manager_id, body.reason.strip())

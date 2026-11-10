@@ -1,0 +1,10 @@
+/* Tailwind CSS: one line brings in all the utility classes used in the components. */
+@import "tailwindcss";
+
+/* A calm, consistent base for the whole dashboard. */
+body {
+  margin: 0;
+  background: #f8fafc; /* slate-50 */
+  color: #0f172a; /* slate-900 */
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}

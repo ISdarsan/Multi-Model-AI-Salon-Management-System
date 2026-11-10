@@ -1,0 +1,64 @@
+// Small helpers that turn database values into readable text.
+
+// The salon's data is stored in UTC, so every time on the dashboard is shown in UTC.
+export function fmtDateTime(iso) {
+  if (!iso) return '-'
+  return (
+    new Date(iso).toLocaleString('en-GB', {
+      timeZone: 'UTC', day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit', hour12: false,
+    }) + ' UTC'
+  )
+}
+
+// "5 min ago", "2 h ago"...
+export function timeAgo(iso) {
+  const seconds = Math.max(0, Math.round((Date.now() - new Date(iso).getTime()) / 1000))
+  if (seconds < 60) return `${seconds}s ago`
+  if (seconds < 3600) return `${Math.round(seconds / 60)} min ago`
+  if (seconds < 86400) return `${Math.round(seconds / 3600)} h ago`
+  return `${Math.round(seconds / 86400)} d ago`
+}
+
+// Friendly names for the agents.
+const AGENT_NAMES = {
+  inventory_agent: 'Inventory Agent',
+  scheduling_agent: 'Scheduling Agent',
+  orchestrator: 'Orchestrator',
+}
+export const agentName = (name) => AGENT_NAMES[name] || name
+
+// Say what a proposed action will do, in plain words.
+// `products` is a lookup { sku: product name } used for purchase orders.
+export function describeAction(action, products = {}) {
+  const input = action.input || {}
+  const result = action.result || {}
+
+  if (action.tool_called === 'create_draft_po') {
+    const sku = result.sku || input.sku
+    const name = products[sku] ? `${products[sku]} (${sku})` : sku
+    return {
+      title: `Order ${result.qty} × ${name}`,
+      detail: `From supplier ${result.supplier}. Nothing is ordered until you approve.`,
+    }
+  }
+  if (action.tool_called === 'reassign_staff') {
+    return {
+      title: `Move the ${input.service} at ${fmtDateTime(input.start_time)}`,
+      detail: `From ${input.old_staff_name} to ${input.new_staff_name}. The appointment changes only when you approve.`,
+    }
+  }
+  if (action.tool_called === 'hold_appointment') {
+    return {
+      title: `Put the ${input.service} at ${fmtDateTime(input.start_time)} on hold`,
+      detail: `It needs ${input.units_needed} × ${input.sku}, but only ${input.stock_before_this_booking} would be left for it.`,
+    }
+  }
+  return { title: action.tool_called, detail: '' }
+}
+
+// Which decision_log outcome belongs to which kind of action (used to find an action's reasoning).
+export const PROPOSAL_OUTCOME = {
+  create_draft_po: 'draft PO created, waiting for approval',
+  reassign_staff: 'reassignment proposed, waiting for approval',
+  hold_appointment: 'clash found, hold proposed, waiting for approval',
+}

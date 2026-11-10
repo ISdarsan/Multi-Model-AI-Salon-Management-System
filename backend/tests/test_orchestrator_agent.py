@@ -88,7 +88,10 @@ def main():
                 original_status.setdefault(b["id"], b["status"])
             print(f"  expected clashes now: {len(clashes)}")
         assert clashes, "no clash could be created for the test"
-        expected_ids = [c["booking"]["id"] for c in clashes]
+        # At most MAX_HOLDS_PER_EVENT holds are proposed (the earliest clashes first).
+        expected_ids = [c["booking"]["id"] for c in clashes][:orchestrator.MAX_HOLDS_PER_EVENT]
+        not_proposed = max(0, len(clashes) - orchestrator.MAX_HOLDS_PER_EVENT)
+        print(f"  so {len(expected_ids)} hold(s) should be proposed and {not_proposed} left out by the cap")
 
         heading("STEP 1: stock_low event for COL-6N -> Orchestrator -> Inventory Agent -> clash check")
         # Created as 'processing' (already claimed), exactly as the worker would hand it over.
@@ -127,6 +130,10 @@ def main():
                   f"stock left for it {i['stock_before_this_booking']} (stock now {i['stock_now']})")
             print(f"  approvals    : status={approvals[a['id']]['status']}")
         assert [a["input"]["appointment_id"] for a in holds] == expected_ids, "the proposals do not match the expected clashes"
+        cap_rows = [r for r in summary["results"] if r["outcome"] == "clash limit reached, more holds not proposed"]
+        assert len(cap_rows) == (1 if not_proposed else 0), "the cap should write exactly one 'limit reached' log row"
+        if cap_rows:
+            print(f"  cap log row: {cap_rows[0]['detail'][:150]}...")
 
         print("\nDecision log rows for this event:")
         for log in supabase.table("decision_log").select("*").eq("event_id", event["id"]).order("created_at").execute().data:

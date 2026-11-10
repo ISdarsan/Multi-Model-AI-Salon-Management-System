@@ -61,16 +61,16 @@ python -m backend.tests.test_inventory_agent
 
 Managers approve or reject with `backend/approvals/approval_actions.py` (`approve(approval_id, decided_by)` and `reject(approval_id, decided_by, reason)`).
 
-**Test leftovers:** `decision_log` can never be edited or deleted, and an event that has log rows cannot be deleted either. So the test cleans up purchase orders, actions and approvals, but leaves its events (`source = 'inventory_test'`) and their log rows (the other tests leave `worker_test`, `scheduling_test` and `orchestrator_test` events). To remove them by hand, paste this into the Supabase SQL Editor. It switches the protection off for a moment, so only run it for test data:
+**Test leftovers:** `decision_log` can never be edited or deleted, and an event that has log rows cannot be deleted either. So the test cleans up purchase orders, actions and approvals, but leaves its events (`source = 'inventory_test'`) and their log rows (the other tests leave `worker_test`, `scheduling_test`, `orchestrator_test` and `dashboard_test` events). To remove them by hand, paste this into the Supabase SQL Editor. It switches the protection off for a moment, so only run it for test data:
 
 ```sql
 begin;
 alter table public.decision_log disable trigger decision_log_no_update_delete;
 delete from public.decision_log
   where event_id in (select id from public.events
-                    where source in ('inventory_test', 'worker_test', 'scheduling_test', 'orchestrator_test'));
+                    where source in ('inventory_test', 'worker_test', 'scheduling_test', 'orchestrator_test', 'dashboard_test'));
 alter table public.decision_log enable trigger decision_log_no_update_delete;
-delete from public.events where source in ('inventory_test', 'worker_test', 'scheduling_test', 'orchestrator_test');
+delete from public.events where source in ('inventory_test', 'worker_test', 'scheduling_test', 'orchestrator_test', 'dashboard_test');
 commit;
 ```
 
@@ -133,3 +133,37 @@ If an agent crashes, the Orchestrator marks the event `failed` and writes the re
 python -m backend.tests.test_orchestrator          # offline, no database writes
 python -m backend.tests.test_orchestrator_agent    # live: uses your database, restores everything afterwards
 ```
+
+## Manager dashboard
+
+A web page where the manager signs in, sees what the agents are doing, and approves or rejects their proposals. Built with React, Vite, Tailwind and Supabase.
+
+**Screens:** *Command Centre* (4 numbers: pending approvals, products below reorder level, unhandled events, appointments today, plus a live feed of agent activity), *Approval Inbox* (pending proposals grouped by the event that caused them, each with plain-words description, risk, reasoning and Approve / Reject; rejecting needs a reason), *Decision Log* (every decision, newest first, click a row for the reasoning, filter by outcome). Times are shown in UTC. Updates arrive live (Supabase Realtime) with a 5-second refresh as a fallback.
+
+**How it is secured:** the browser only has the *publishable* key. It signs in with email and password and reads data through Supabase, where row-level security lets only managers see approvals, actions and the log. Approve and reject go through the server (`POST /approvals/{id}/approve` and `/reject`), which checks the sign-in token with Supabase, requires `role = manager` (401 if not signed in, 403 if not a manager), and then runs the same `approve()` / `reject()` as the tests. `POST /events` still uses the `X-API-Key` header.
+
+**Setup (once):**
+
+```powershell
+cd frontend
+copy .env.example .env     # then fill in: VITE_SUPABASE_URL, VITE_SUPABASE_ANON_KEY (the publishable key), VITE_API_URL
+npm install
+```
+
+**Run it** (three terminals, each from the project root, Python environment on for the first two):
+
+```powershell
+# Terminal 1: the server (adds the approve/reject endpoints and allows the dashboard's address)
+uvicorn backend.api.main:app --reload
+
+# Terminal 2: the worker (turns new events into proposals)
+python -m backend.worker
+
+# Terminal 3: the dashboard
+cd frontend
+npm run dev
+```
+
+Open http://localhost:5173 and sign in with `manager@salonos.demo` / `demo1234` (demo login from the seed). A customer login such as `customer1@salonos.demo` sees "This area is for managers only". The dashboard must run on port 5173, because the server only accepts requests from `http://localhost:5173`.
+
+Check the approve and reject endpoints (uses your real database, cleans up after itself): `python -m backend.tests.test_approval_api`. Build check: `cd frontend; npm run build`.

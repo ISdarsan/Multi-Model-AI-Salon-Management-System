@@ -138,6 +138,40 @@ def proposals():
     check("no result, no rows", orch.check_clashes(EVENT, ["NOPE"]) == [] and inserted("tool_called") == [])
 
 
+def cap():
+    print("\n== 6b. at most MAX_HOLDS_PER_EVENT (3) holds per event, earliest first ==")
+    check("MAX_HOLDS_PER_EVENT is 3", orch.MAX_HOLDS_PER_EVENT == 3)
+    five = [booking(f"b{n}", 10 + n, 2, "Full Colour") for n in range(1, 6)]   # b1 earliest ... b5 latest
+    reset(0, five)
+    results = orch.check_clashes(EVENT, ["COL-6N"])
+    proposals = [r for r in results if r["outcome"].startswith("clash found, hold proposed")]
+    check("5 clashes -> only 3 holds are proposed", len(proposals) == 3 and len(inserted("tool_called")) == 3)
+    check("they are the 3 EARLIEST bookings (b1, b2, b3)", [r["appointment_id"] for r in proposals] == ["b1", "b2", "b3"])
+    check("3 approvals, all 'pending'", len(inserted("agent_action_id")) == 3 and all(a["status"] == "pending" for a in inserted("agent_action_id")))
+    cap_logs = [l for l in logs if l["outcome"] == "clash limit reached, more holds not proposed"]
+    check("ONE extra log row says how many were not proposed (2)", len(cap_logs) == 1 and "2 more clash(es)" in cap_logs[0]["reasoning"])
+    print("   cap log:", cap_logs[0]["reasoning"][:170], "...")
+    check("the log names the 2 bookings that were left out", cap_logs[0]["reasoning"].count("Full Colour") == 2)
+    check("3 hold logs + 1 cap log = 4 rows in total", len(logs) == 4)
+
+    reset(0, five[:3])
+    results = orch.check_clashes(EVENT, ["COL-6N"])
+    check("exactly 3 clashes -> 3 holds and NO cap log row", len(inserted("tool_called")) == 3
+          and not any(l["outcome"].startswith("clash limit") for l in logs))
+
+    print("   two products: the cap counts ALL products together, earliest booking first")
+    reset(0, [booking("late", 30, 1), booking("early", 11, 1), booking("mid", 20, 1), booking("mid2", 21, 1)])
+    results = orch.check_clashes(EVENT, ["COL-6N", "COL-7N"])
+    proposals = [r["appointment_id"] for r in results if r["outcome"].startswith("clash found, hold proposed")]
+    check("still only 3 holds in total, and they are the earliest ones", proposals == ["early", "mid", "mid2"])
+
+    print("   a hold that is already pending does not use up the cap")
+    reset(0, five, pending={"b1"})
+    results = orch.check_clashes(EVENT, ["COL-6N"])
+    proposals = [r["appointment_id"] for r in results if r["outcome"].startswith("clash found, hold proposed")]
+    check("b1 is 'already proposed', and 3 NEW holds are still proposed (b2, b3, b4)", proposals == ["b2", "b3", "b4"])
+
+
 def routing():
     print("\n== 7. routing ==")
     check("stock_low and shelf_observation -> inventory_agent, staff_absent -> scheduling_agent",
@@ -201,5 +235,6 @@ if __name__ == "__main__":
     rules()
     lookahead()
     proposals()
+    cap()
     routing()
     print("\nALL OFFLINE ORCHESTRATOR CHECKS PASSED (no database rows written)")

@@ -29,6 +29,7 @@ from backend.tools.orchestrator_tools import get_pending_hold_appointment_ids, g
 AGENT_NAME = "orchestrator"
 
 LOOKAHEAD_DAYS = 3   # only bookings that start within the next 3 days are checked for a clash
+MAX_HOLDS_PER_EVENT = 3   # at most 3 hold proposals per event (earliest bookings first)
 
 # ----------------------------------------------------------------------------
 # 1. Routing: which agent handles which event type
@@ -168,12 +169,19 @@ def propose_hold(event: dict, sku: str, current_qty: int, clash: dict) -> dict:
 # ----------------------------------------------------------------------------
 
 def check_clashes(event: dict, skus: list) -> list:
-    """Run the clash rule for each product (by sku) and write the proposals. Returns a list of result dicts."""
+    """
+    Run the clash rule for each product (by sku) and write the proposals. Returns a list of result dicts.
+
+    At most MAX_HOLDS_PER_EVENT holds are proposed per event (the EARLIEST bookings first), so a very low
+    stock does not flood the manager's inbox. One log row says how many were not proposed.
+    """
     now = datetime.now(timezone.utc)
     limit = now + timedelta(days=LOOKAHEAD_DAYS)
     pending = get_pending_hold_appointment_ids()   # appointments that already have a hold waiting
     results = []
 
+    # Step 1: find every clash for every product (nothing is written yet).
+    found = []   # (sku, stock now, clash)
     for sku in skus:
         stock = get_stock(sku=sku)
         if not stock:
@@ -182,24 +190,47 @@ def check_clashes(event: dict, skus: list) -> list:
         # Upcoming 'booked' appointments that use this product, but only those inside the lookahead window.
         bookings = [b for b in get_upcoming_bookings(stock["product_id"], now.isoformat())
                     if parse_dt(b["start_time"]) < limit]
-
         for clash in find_clashes(stock["current_qty"], bookings):
-            booking = clash["booking"]
-            service = booking["services"]["name"]
-            start = parse_dt(booking["start_time"])
+            found.append((sku, stock["current_qty"], clash))
 
-            # Never create a second proposal for an appointment that already has one waiting.
-            if booking["id"] in pending:
-                why = (f"Clash on {sku} for the {service} on {start:%a %Y-%m-%d %H:%M}, but a hold "
-                       "proposal for this appointment is already waiting for approval, so no new one was made.")
-                add_decision_log(event["id"], CLASH_AGENTS, why, "clash found, hold already proposed")
-                results.append({"label": f"hold {service} {start:%H:%M}",
-                                "outcome": "clash found, hold already proposed", "detail": why})
-                continue
+    # Step 2: earliest bookings first, so the cap keeps the ones that matter most.
+    found.sort(key=lambda item: (parse_dt(item[2]["booking"]["start_time"]), item[2]["booking"]["id"]))
 
-            result = propose_hold(event, sku, stock["current_qty"], clash)
-            pending.add(booking["id"])   # so a second product clashing on the same booking does not double up
-            results.append(result)
+    proposed = 0
+    not_proposed = {}   # appointment id -> short description of the clash we did not propose
+    for sku, current_qty, clash in found:
+        booking = clash["booking"]
+        service = booking["services"]["name"]
+        start = parse_dt(booking["start_time"])
+
+        # Never create a second proposal for an appointment that already has one waiting.
+        if booking["id"] in pending:
+            why = (f"Clash on {sku} for the {service} on {start:%a %Y-%m-%d %H:%M}, but a hold "
+                   "proposal for this appointment is already waiting for approval, so no new one was made.")
+            add_decision_log(event["id"], CLASH_AGENTS, why, "clash found, hold already proposed")
+            results.append({"label": f"hold {service} {start:%H:%M}",
+                            "outcome": "clash found, hold already proposed", "detail": why})
+            continue
+
+        # The cap: after MAX_HOLDS_PER_EVENT proposals, remember the rest but do not propose them.
+        if proposed >= MAX_HOLDS_PER_EVENT:
+            not_proposed.setdefault(booking["id"], f"{service} {start:%a %Y-%m-%d %H:%M} ({sku})")
+            continue
+
+        results.append(propose_hold(event, sku, current_qty, clash))
+        pending.add(booking["id"])   # so a second product clashing on the same booking does not double up
+        proposed += 1
+
+    # Step 3: one log row saying how many clashes were NOT proposed because of the cap.
+    if not_proposed:
+        count = len(not_proposed)
+        why = (f"{count} more clash(es) were found but no hold was proposed for them, because at most "
+               f"{MAX_HOLDS_PER_EVENT} holds are proposed per event (the earliest bookings first). "
+               f"Not proposed: {'; '.join(not_proposed.values())}. "
+               "They will be checked again the next time a stock event for this product arrives.")
+        add_decision_log(event["id"], CLASH_AGENTS, why, "clash limit reached, more holds not proposed")
+        results.append({"label": "more holds", "outcome": "clash limit reached, more holds not proposed",
+                        "detail": why, "not_proposed": count})
 
     return results
 
